@@ -29,11 +29,11 @@
        (.exists (io/file path))))
 
 (defn- get-lib-jars
-  "Get all JAR files from basis that contain precompiled classes."
+  "Get all JAR files from basis.
+  Includes source-only JARs (e.g. core.specs.alpha) — Clojure needs them at runtime."
   [basis]
   (->> (:classpath-roots basis)
-       (filter jar-file?)
-       (filter has-class-files?)))
+       (filter jar-file?)))
 
 (defn- copy-lib-jars!
   "Copy precompiled JARs to lib/ directory."

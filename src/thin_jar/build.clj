@@ -94,6 +94,17 @@
     (b/copy-dir {:src-dirs src-dirs
                  :target-dir class-dir})
 
+    ;; Copy non-JAR classpath entries (git deps, local deps with source dirs)
+    (let [extra-dirs (->> (:classpath-roots basis)
+                          (remove jar-file?)
+                          (remove #(some (fn [sd] (= (str (io/file sd)) (str (io/file %))))
+                                         src-dirs))
+                          (filter #(.isDirectory (io/file %))))]
+      (when (seq extra-dirs)
+        (println (str "Copying " (count extra-dirs) " source-based deps to app JAR"))
+        (b/copy-dir {:src-dirs (vec extra-dirs)
+                     :target-dir class-dir})))
+
     ;; Compile app code
     (println "Compiling Clojure sources...")
     (b/compile-clj {:basis basis

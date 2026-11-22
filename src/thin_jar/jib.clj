@@ -1,34 +1,149 @@
 (ns thin-jar.jib
-  "Jib deployment functions with layer support for Docker images.
-
-   Supports three layer types:
-   - :deps  - JAR dependencies from lib/ directory
-   - :app   - Thin application JAR
-   - :files - Additional files (Python scripts, configs, etc.)"
-  (:require [clojure.java.io :as io])
+  "Plan and build layered container images with Jib."
+  (:require
+   [clojure.java.io :as io]
+   [clojure.string :as str])
   (:import
-   (com.google.cloud.tools.jib.api Jib
-                                   RegistryImage
-                                   Containerizer
-                                   ImageReference)
-   (com.google.cloud.tools.jib.api.buildplan AbsoluteUnixPath
-                                             FileEntriesLayer)
+   (com.google.cloud.tools.jib.api Containerizer ImageReference Jib JibContainer JibContainerBuilder LogEvent RegistryImage TarImage)
+   (com.google.cloud.tools.jib.api.buildplan AbsoluteUnixPath FileEntriesLayer)
    (com.google.cloud.tools.jib.frontend CredentialRetrieverFactory)
-   (java.util.function Consumer)
-   (java.nio.file Paths)
    (java.io File)
-   (java.util ArrayList List)))
+   (java.util ArrayList List)
+   (java.util.function Consumer)))
 
-;; ============================================================
-;; Internal helpers
-;; ============================================================
+(def version "The thin-jar-build library version." "0.2.0")
 
-(defn- get-path [filename]
-  (Paths/get (.toURI (File. ^String filename))))
+(def ^:private default-base "gcr.io/distroless/java21")
+(def ^:private base-label "org.opencontainers.image.base.name")
+(def ^:private version-label "io.github.realgenekim.thin-jar.version")
 
-(defn- into-list
-  [& args]
-  (ArrayList. ^List args))
+(def ^:private spec-contract
+  {:top {:allowed #{:base :base-image :target-image :entrypoint :layers :verbose :to :to-tar :env :labels}
+         :required #{:entrypoint :layers}}
+   :base {:allowed #{:image :reason}
+          :required #{:image :reason}}
+   :to {:allowed #{:registry :tar :image-name}
+        :required #{}
+        :alternatives {:registry #{:registry}
+                       :tar #{:tar :image-name}}}
+   :layers {:deps {:allowed #{:type :lib-dir :container-path}
+                   :required #{:type :lib-dir :container-path}
+                   :source-key :lib-dir}
+            :app {:allowed #{:type :jar-path :container-path}
+                  :required #{:type :jar-path :container-path}
+                  :source-key :jar-path}
+            :files {:allowed #{:type :local-dir :container-path :extensions :blacklist-prefixes :names}
+                    :required #{:type :local-dir :container-path}
+                    :source-key :local-dir}}})
+
+(defn- invalid-config! [reason path allowed & [offending]]
+  (let [offending (vec (sort-by pr-str offending))
+        environment? (and (= reason :unknown-key) (empty? path)
+                          (some #{:environment} offending))]
+    (throw (ex-info (str "Invalid Jib configuration " (pr-str reason) " at " (pr-str path)
+                         (when environment?
+                           ". Use :env to add or override individual variables. The :environment key of another fork sets the whole environment map on the Jib builder and enforces JVM flags, so it is not accepted as an alias."))
+                    {:type ::invalid-config
+                     :reason reason
+                     :path path
+                     :offending-keys offending
+                     :unknown-keys (if (= reason :unknown-key) offending [])
+                     :allowed-keys (vec (sort allowed))}))))
+
+(defn- validate-required! [spec path allowed required]
+  (when-let [missing (first (remove spec (sort required)))]
+    (invalid-config! :missing-required-key (conj path missing) allowed [missing])))
+
+(defn- validate-keys! [spec path {:keys [allowed required]}]
+  (when-not (map? spec)
+    (invalid-config! :expected-map path allowed (take-last 1 path)))
+  (when-let [unknown (seq (remove allowed (keys spec)))]
+    (invalid-config! :unknown-key path allowed unknown))
+  (validate-required! spec path allowed required))
+
+(defn- source-exists? [source]
+  (try
+    (some-> (io/file source) .exists)
+    (catch IllegalArgumentException _
+      false)))
+
+(defn- validate-layer! [index layer]
+  (let [path [:layers index]
+        type-path (conj path :type)]
+    (when-not (map? layer)
+      (invalid-config! :expected-map path #{:type}))
+    (let [{:keys [type]} layer
+          {:keys [allowed source-key] :as contract} (get-in spec-contract [:layers type])]
+      (cond
+        (nil? type) (invalid-config! :missing-required-key type-path #{:type} [:type])
+        (nil? contract) (invalid-config! :unknown-layer-type type-path #{:type} [:type]))
+      (validate-keys! layer path contract)
+      (when-not (source-exists? (get layer source-key))
+        (invalid-config! :source-not-found (conj path source-key) allowed [source-key])))))
+
+(defn- nonblank-string? [x]
+  (and (string? x) (not (str/blank? x))))
+
+(defn- string-map? [x]
+  (and (map? x)
+       (every? (fn [[k v]] (and (string? k) (string? v))) x)))
+
+(defn- validate-destination! [spec top-allowed]
+  (if (contains? spec :to)
+    (let [legacy-keys (filter #(contains? spec %) [:target-image :to-tar])
+          {:keys [to]} spec
+          {:keys [allowed alternatives] :as destination-contract} (:to spec-contract)]
+      (when (seq legacy-keys)
+        (invalid-config! :conflicting-keys [] top-allowed (cons :to legacy-keys)))
+      (validate-keys! to [:to] destination-contract)
+      (when (empty? to)
+        (invalid-config! :no-destination [:to] allowed (keys alternatives)))
+      (let [mode (if (contains? to :registry) :registry :tar)
+            required (alternatives mode)]
+        (when (some (complement required) (keys to))
+          (invalid-config! :conflicting-keys [:to] allowed (keys to)))
+        (validate-required! to [:to] allowed required))
+      (doseq [[k v] to]
+        (when-not (nonblank-string? v)
+          (invalid-config! :invalid-destination [:to k] allowed [k]))))
+    (do
+      (when-not (:target-image spec)
+        (if (contains? spec :to-tar)
+          (validate-required! spec [] top-allowed #{:target-image})
+          (invalid-config! :no-destination [] top-allowed [:to :target-image])))
+      (when (and (contains? spec :to-tar) (not (nonblank-string? (:to-tar spec))))
+        (invalid-config! :invalid-to-tar [:to-tar] top-allowed [:to-tar])))))
+
+(defn- validate-base! [spec allowed]
+  (when (contains? spec :base)
+    (when (contains? spec :base-image)
+      (invalid-config! :conflicting-keys [] allowed [:base :base-image]))
+    (let [base (:base spec)
+          contract (:base spec-contract)]
+      (validate-keys! base [:base] contract)
+      (doseq [k [:image :reason]]
+        (when-not (nonblank-string? (get base k))
+          (invalid-config! :invalid-base [:base k] (:allowed contract) [k]))))))
+
+(defn validate-spec!
+  "Return spec if its configuration and layer sources are valid. Throw ex-info otherwise."
+  [spec]
+  (let [{:keys [allowed] :as contract} (:top spec-contract)]
+    (validate-keys! spec [] contract)
+    (validate-destination! spec allowed)
+    (validate-base! spec allowed)
+    (let [{:keys [layers env labels]} spec]
+      (when-not (and (sequential? layers) (seq layers))
+        (invalid-config! :invalid-layers [:layers] allowed [:layers]))
+      (when (and (some? env) (not (string-map? env)))
+        (invalid-config! :invalid-env [:env] allowed [:env]))
+      (when (and (contains? spec :labels) (not (string-map? labels)))
+        (invalid-config! :invalid-labels [:labels] allowed [:labels]))
+      (when-let [reserved (seq (filter #(contains? labels %) [base-label version-label]))]
+        (invalid-config! :conflicting-keys [:labels] allowed reserved))
+      (doseq [[index layer] (map-indexed vector layers)]
+        (validate-layer! index layer))))
+  spec)
 
 (defn- to-imgref [image-config]
   (ImageReference/parse image-config))
@@ -37,158 +152,118 @@
   "Create a Jib logger Consumer."
   [verbose]
   (reify Consumer
-    (accept [this log-event]
+    (accept [_ log-event]
       (when verbose
         (println (.getMessage log-event))))))
 
-(def ^:private default-logger (make-logger true))
+(defn- file-entry [^File file container-path]
+  {:source (.getAbsolutePath file)
+   :container-path (str (AbsoluteUnixPath/get container-path))})
 
-;; ============================================================
-;; Layer builders
-;; ============================================================
+(defn- directory-entries [dir container-path include?]
+  (for [^File file (.listFiles (io/file dir))
+        :when (and (.isFile file) (include? (.getName file)))]
+    (file-entry file (str container-path "/" (.getName file)))))
 
-(defn- build-deps-layer
-  "Build a Jib layer from a lib/ directory containing precompiled JARs."
-  [{:keys [lib-dir container-path]}]
-  (let [lib-dir-file (io/file lib-dir)
-        builder (FileEntriesLayer/builder)]
-    (.setName builder "dependencies")
-    (doseq [jar-file (.listFiles lib-dir-file)]
-      (when (.isFile jar-file)
-        (.addEntry builder
-                   (.toPath jar-file)
-                   (AbsoluteUnixPath/get (str container-path "/" (.getName jar-file))))))
+(defn- plan-layer [{:keys [type lib-dir jar-path local-dir container-path extensions blacklist-prefixes names]
+                    :or {extensions #{".py" ".txt" ".sh" ".json" ".yaml" ".yml"}
+                         blacklist-prefixes []}}]
+  (let [[name entries]
+        (case type
+          :deps ["dependencies" (directory-entries lib-dir container-path (constantly true))]
+          :app ["application" [(file-entry (io/file jar-path) container-path)]]
+          :files [(str "files:" local-dir)
+                  (directory-entries local-dir container-path
+                                     (fn [filename]
+                                       (and (some #(str/ends-with? filename %) extensions)
+                                            (or (nil? names) (contains? names filename))
+                                            (not-any? #(str/starts-with? filename %) blacklist-prefixes))))])]
+    {:type type
+     :name name
+     :entries (vec entries)}))
+
+(defn plan
+  "Validate a spec and resolve its destination, base and layer entries using local files."
+  [spec]
+  (let [{:keys [to target-image to-tar base base-image entrypoint env labels layers verbose]
+         :or {base-image default-base verbose true}} (validate-spec! spec)
+        base (or base {:image base-image :legacy true})]
+    {:destination (or to
+                      (if to-tar
+                        {:tar to-tar :image-name target-image}
+                        {:registry target-image}))
+     :base base
+     :entrypoint (vec entrypoint)
+     :env (or env {})
+     :labels (assoc labels base-label (:image base) version-label version)
+     :layers (mapv plan-layer layers)
+     :verbose verbose}))
+
+(defn- make-containerizer [target-image to-tar logger]
+  (if to-tar
+    (Containerizer/to
+      (-> (TarImage/at (.toPath (.getAbsoluteFile (io/file to-tar))))
+          (.named (to-imgref target-image))))
+    (Containerizer/to
+      (-> (RegistryImage/named (to-imgref target-image))
+          (.addCredentialRetriever
+            (-> (CredentialRetrieverFactory/forImage (to-imgref target-image) logger)
+                (.dockerConfig)))))))
+
+(defn- build-layer [{:keys [name entries]}]
+  (let [builder (.setName (FileEntriesLayer/builder) name)]
+    (doseq [{:keys [source container-path]} entries]
+      (.addEntry builder (.toPath (io/file source)) (AbsoluteUnixPath/get container-path)))
     (.build builder)))
 
-(defn- build-app-layer
-  "Build a Jib layer for the thin application JAR."
-  [{:keys [jar-path container-path]}]
-  (-> (FileEntriesLayer/builder)
-      (.setName "application")
-      (.addEntry (get-path jar-path)
-                 (AbsoluteUnixPath/get container-path))
-      (.build)))
+(defn- base-builder [base target-image logger]
+  (if (and (= "scratch" (:image base)) (not (:legacy base)))
+    (Jib/fromScratch)
+    (Jib/from
+      (-> (RegistryImage/named ^String (:image base))
+          (.addCredentialRetriever
+            (-> (CredentialRetrieverFactory/forImage (to-imgref target-image) logger)
+                (.dockerConfig)))))))
 
-(defn- matches-extension?
-  "Check if filename matches any of the extensions."
-  [filename extensions]
-  (some #(.endsWith filename %) extensions))
+(defn- containerize! [^JibContainerBuilder builder ^Containerizer containerizer]
+  (.containerize builder containerizer))
 
-(defn- blacklisted-prefix?
-  "Check if filename starts with any blacklisted prefix."
-  [filename prefixes]
-  (some #(.startsWith filename %) prefixes))
-
-(defn- build-files-layer
-  "Build a Jib layer for additional files (Python scripts, configs).
-
-   Options:
-   - :local-dir      - Local directory to include
-   - :container-path - Container destination path
-   - :extensions     - Set of file extensions to include (e.g. #{\".py\" \".txt\"})
-   - :blacklist-prefixes - Prefixes to exclude (e.g. [\"test_\" \"experiment_\"])"
-  [{:keys [local-dir container-path extensions blacklist-prefixes]
-    :or {extensions #{".py" ".txt" ".sh" ".json" ".yaml" ".yml"}
-         blacklist-prefixes []}}]
-  (let [dir (io/file local-dir)
-        builder (FileEntriesLayer/builder)]
-    (.setName builder (str "files:" local-dir))
-    (when (.exists dir)
-      (doseq [f (.listFiles dir)]
-        (when (and (.isFile f)
-                   (matches-extension? (.getName f) extensions)
-                   (not (blacklisted-prefix? (.getName f) blacklist-prefixes)))
-          (.addEntry builder
-                     (.toPath f)
-                     (AbsoluteUnixPath/get (str container-path "/" (.getName f)))))))
-    (.build builder)))
-
-(defn- build-layer
-  "Build a single layer based on its type."
-  [{:keys [type] :as layer-spec}]
-  (case type
-    :deps (build-deps-layer layer-spec)
-    :app (build-app-layer layer-spec)
-    :files (build-files-layer layer-spec)
-    (throw (ex-info (str "Unknown layer type: " type) {:layer-spec layer-spec}))))
-
-;; ============================================================
-;; Public API
-;; ============================================================
+(defn- execute-plan! [{:keys [destination base entrypoint env labels layers verbose]}]
+  (let [{:keys [registry tar image-name]} destination
+        target-image (or registry image-name)
+        logger (make-logger verbose)
+        builder (base-builder base target-image logger)
+        containerizer (make-containerizer target-image tar logger)]
+    (.addEventHandler containerizer LogEvent logger)
+    (doseq [layer layers]
+      (.addFileEntriesLayer builder (build-layer layer)))
+    (doseq [[k v] (sort env)]
+      (.addEnvironmentVariable builder k v))
+    (.setLabels builder labels)
+    (.setEntrypoint builder (ArrayList. ^List entrypoint))
+    (let [^JibContainer result (containerize! builder containerizer)]
+      {:destination destination
+       :pushed? (.isImagePushed result)
+       :image-digest (str (.getDigest result))
+       :image-id (str (.getImageId result))
+       :base (select-keys base [:image])
+       :labels labels
+       :library-version version})))
 
 (defn deploy!
-  "Deploy container image with specified layers.
-
-   Required keys:
-   - :target-image - Full image name with tag (e.g. \"us-west1-docker.pkg.dev/proj/repo/img:latest\")
-   - :entrypoint   - Vector of entrypoint strings (e.g. [\"java\" \"-jar\" \"/app.jar\"])
-   - :layers       - Vector of layer specs (non-empty)
-
-   Optional keys:
-   - :base-image   - Base image (default: \"gcr.io/distroless/java21\")
-   - :verbose      - Print Jib logs (default: true)
-
-   Layer specs (each requires :type):
-   - {:type :deps :lib-dir \"target/lib\" :container-path \"/app/lib\"}
-   - {:type :app :jar-path \"target/app.jar\" :container-path \"/app/app.jar\"}
-   - {:type :files :local-dir \"scripts\" :container-path \"/scripts\"
-      :extensions #{\".py\"} :blacklist-prefixes [\"test_\"]}
-
-   Returns the Jib build result."
-  [{:keys [base-image target-image entrypoint layers verbose]
-    :or {base-image "gcr.io/distroless/java21"
-         verbose true}}]
-  ;; Validate required keys
-  (when-not target-image
-    (throw (ex-info "Required: :target-image" {})))
-  (when-not entrypoint
-    (throw (ex-info "Required: :entrypoint" {})))
-  (when (empty? layers)
-    (throw (ex-info "Required: :layers (non-empty)" {})))
-
-  (let [logger (make-logger verbose)]
-    (println "Building and pushing container image with Jib...")
-    (println (str "  Base image: " base-image))
-    (println (str "  Target image: " target-image))
-    (println "  Layers:")
-    (doseq [{:keys [type] :as layer} layers]
-      (println (str "    - " type ": " (dissoc layer :type))))
-
-    (let [base-image-with-creds
-          (-> (RegistryImage/named base-image)
-              (.addCredentialRetriever
-               (-> (CredentialRetrieverFactory/forImage
-                    (to-imgref target-image)
-                    logger)
-                   (.dockerConfig))))
-
-          containerizer
-          (Containerizer/to
-           (-> (RegistryImage/named (to-imgref target-image))
-               (.addCredentialRetriever
-                (-> (CredentialRetrieverFactory/forImage
-                     (to-imgref target-image)
-                     logger)
-                    (.dockerConfig)))))
-
-          ;; Build all layers
-          built-layers (mapv build-layer layers)
-
-          ;; Start with base image
-          jib-builder (Jib/from base-image-with-creds)]
-
-      ;; Add all layers
-      (doseq [layer built-layers]
-        (.addFileEntriesLayer jib-builder layer))
-
-      ;; Set entrypoint and containerize
-      (time
-       (-> jib-builder
-           (.setEntrypoint (apply into-list entrypoint))
-           (.containerize containerizer)))
-
-      (println "Container image built and pushed successfully!")
-      (println (str "  Image: " target-image)))))
+  "Build the validated image and return a receipt. Legacy destination keys retain
+   the fork's receipt fields and expose the normalized map as :resolved-destination."
+  [spec]
+  (let [{:keys [destination image-digest] :as receipt} (execute-plan! (plan spec))]
+    (if (contains? spec :to)
+      receipt
+      (let [{:keys [registry tar image-name]} destination]
+        (assoc receipt
+               :destination (if tar :tar :registry)
+               :resolved-destination destination
+               :target-image (or registry image-name)
+               :tar-path tar
+               :digest image-digest)))))
 
 (comment
   ;; Example: server2 thin JAR deployment

@@ -60,45 +60,85 @@ Options:
                           :container-path "/app/myapp.jar"}]}))
 ```
 
-## Layer Types
+## Jib contract
 
-### :deps - JAR dependencies
+`thin-jar.jib/plan` and `deploy!` accept these keys. Unknown keys fail before
+credential lookup or image building. Errors report the reason, path, allowed
+keys, and offending keys.
+
+| Scope | Allowed keys | Required keys | Existing local source |
+| --- | --- | --- | --- |
+| top | `:entrypoint`, `:layers`, `:to`, `:target-image`, `:to-tar`, `:base`, `:base-image`, `:env`, `:labels`, `:verbose` | `:entrypoint`, `:layers`, and a destination | |
+| to | `:registry`, `:tar`, `:image-name` | `:registry` alone, or `:tar` and `:image-name` | |
+| base | `:image`, `:reason` | `:image`, `:reason` | |
+| deps | `:type`, `:lib-dir`, `:container-path` | `:type`, `:lib-dir`, `:container-path` | `:lib-dir` |
+| app | `:type`, `:jar-path`, `:container-path` | `:type`, `:jar-path`, `:container-path` | `:jar-path` |
+| files | `:type`, `:local-dir`, `:container-path`, `:extensions`, `:blacklist-prefixes`, `:names` | `:type`, `:local-dir`, `:container-path` | `:local-dir` |
+
+`:entrypoint` is a sequence of strings, and `:layers` is a non-empty sequence in
+build order. Container paths are absolute Unix paths. A `:deps` layer includes
+every regular file directly in `:lib-dir`. A `:files` layer selects regular files
+directly in `:local-dir` by extension (default `.py`, `.txt`, `.sh`, `.json`,
+`.yaml`, `.yml`), then applies the optional exact filename set `:names` and the
+optional exclusion list `:blacklist-prefixes`. Jib logging defaults to enabled.
+
+### Destination and base
 
 ```clojure
-{:type :deps
- :lib-dir "target/lib"           ; Local directory with JARs
- :container-path "/app/lib"}     ; Container destination
+{:to {:registry "us-west1-docker.pkg.dev/proj/repo/myapp:latest"}}
+{:to {:tar "target/myapp.tar" :image-name "myapp:local"}}
+{:base {:image "gcr.io/distroless/java21" :reason "Java 21 runtime"}}
 ```
 
-### :app - Application JAR
+A tar destination writes a local archive. Jib can still pull a registry base
+when building that archive. Use `:base {:image "scratch" :reason "..."}` to build
+from an empty base. A declared base requires a non-blank reason. With no base
+configured, the floating default is `gcr.io/distroless/java21`.
+
+`:env` adds or overrides individual variables using a map of strings to strings.
+`:labels` accepts a map of strings to strings. The library reserves and sets
+`org.opencontainers.image.base.name` and `io.github.realgenekim.thin-jar.version`
+to the base reference and library version, respectively.
+
+### Plan and receipt
+
+`(jib/plan spec)` checks local sources and returns data without reading credentials
+or contacting a registry. It includes the normalized `:destination`, `:base`
+(with `:reason` or `:legacy true`), `:entrypoint`, `:env`, `:labels`, `:verbose`,
+and the ordered `:layers`. Each layer includes its type, name and entries with
+absolute local `:source` paths and resolved `:container-path` values.
+
+`(jib/deploy! spec)` executes that plan. With `:to` it returns this receipt shape:
 
 ```clojure
-{:type :app
- :jar-path "target/myapp.jar"    ; Local JAR path
- :container-path "/app/myapp.jar"} ; Container destination
+{:destination {:tar "target/myapp.tar" :image-name "myapp:local"}
+ :pushed? false
+ :image-digest "sha256:..."
+ :image-id "sha256:..."
+ :base {:image "gcr.io/distroless/java21"}
+ :labels {"org.opencontainers.image.base.name" "gcr.io/distroless/java21"
+          "io.github.realgenekim.thin-jar.version" "0.2.0"}
+ :library-version "0.2.0"}
 ```
 
-### :files - Additional files
+Legacy destination calls keep the fork's keyword `:destination` (`:tar` or
+`:registry`), `:target-image`, `:tar-path`, and `:digest`. They expose the
+destination map as `:resolved-destination` and also return the other receipt
+fields shown above. `jib/version` returns the library version string.
 
-For Python scripts, configs, etc:
+### Migration
 
-```clojure
-{:type :files
- :local-dir "scripts"            ; Local directory
- :container-path "/scripts"      ; Container destination
- :extensions #{".py" ".txt"}     ; File extensions to include
- :blacklist-prefixes ["test_"]}  ; Prefixes to exclude
-```
+| Old key or combination | Current form | Still accepted? |
+| --- | --- | --- |
+| `:target-image` | `:to {:registry ref}` | Yes |
+| `:target-image` and `:to-tar` | `:to {:tar path :image-name ref}` | Yes |
+| `:base-image` | `:base {:image ref :reason why}` | Yes |
+| `:env` | `:env` | Yes |
+| `:names` in a files layer | `:names` | Yes |
+| `:environment` (another fork's key) | Use `:env` and apply any required JVM flag policy in the caller | No |
 
-## Options
-
-### deploy!
-
-- `:target-image` (required) - Full image name with tag
-- `:entrypoint` (required) - Vector of entrypoint strings
-- `:layers` (required) - Vector of layer specs
-- `:base-image` - Base image (default: "gcr.io/distroless/java21")
-- `:verbose` - Print Jib logs (default: true)
+Supply one destination form and at most one base form. Run the offline tests
+with `clojure -X:test`.
 
 ## Examples
 

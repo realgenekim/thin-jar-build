@@ -12,37 +12,41 @@
   plus a public library version (in the receipt) and one provenance label,
   `org.opencontainers.image.base.name`. No version label: it would change every
   image digest on each library release.
-- Kept the floating `gcr.io/distroless/java21` default: this release makes no
-  breaking change. A later release may record the default base digest as
-  release data and report the live digests across consumers. Announce the
-  tradeoff before changing the default: pinning a digest stops automatic
-  pickup of JDK patches.
+- Kept the floating `gcr.io/distroless/java21` default so consumers continue to
+  pick up JDK patches. A later release may record the default base digest as release
+  data and report the live digests across consumers. Announce the tradeoff before
+  changing the default: pinning a digest stops automatic pickup of JDK patches.
 
 ### Behaviour changes
 
 - `deploy!` returns a receipt. At `f5bd8dd` it returned nil.
-- Newly refused, before any build or push, with a typed `ex-info` `:reason`:
-  unknown keys; missing or wrong-kind sources; malformed values such as a string
-  or empty entrypoint (an empty one threw at `f5bd8dd`) or an unparseable image
-  reference; `:names` given
-  as a map or containing a non-string; conflicting or missing destinations.
+- Validation reports a typed `ex-info` for unknown keys, a conflicting or
+  missing destination, an app JAR whose path is missing or does not point to a
+  regular file, a string, empty, or non-string entrypoint, an image reference
+  Jib cannot parse, an empty non-map collection of layers, and a relative
+  container path.
 - Vector, list and Java-array `:names` allowlists now match filenames by value
   (the fork's `contains?` did not match their elements). This is additive.
-- Still accepted as at `f5bd8dd`: a `java.io.File` directory `:container-path`,
+  Maps match by key and sets keep their existing membership rules.
+- Still accepted as at `f5bd8dd`: a directory `:container-path` given as any
+  object whose text form is an absolute path (`java.io.File`, `java.nio.file.Path`),
   an `ImageReference` `:base-image`, and `:extensions nil` (an empty selection,
   reported below).
-- Empty directory layers are recorded in `:empty-layers` in the plan and both
-  receipt shapes. Jib drops empty layers. Deployment prints one warning per
-  empty layer before building, regardless of `:verbose`.
+- A directory layer that contributes zero files reports its cause as `:missing`
+  (source path does not exist), `:not-a-directory` (source is a file), `:empty`
+  (directory has no files), or `:filtered` (filters excluded every file).
+  The plan and both receipt shapes record it in `:empty-layers`. Jib drops empty
+  layers. Deployment prints one warning per empty layer before building,
+  regardless of `:verbose`.
 
   ```text
-  WARNING thin-jar: layer <i> (<type> <source>) selects no files; filters: <filters>
+  WARNING thin-jar: layer <i> (<type> <source>) selects no files (<cause>); filters: <filters>
   ```
 - An omitted, nil, or empty directory-layer `:container-path` means the image root `/`.
 
 Every other spec that planned and built at `f5bd8dd` or in the fork is meant to
-build the same image content. The tests and four review rounds exercised the
-forms named here; specs they did not exercise are not separately proven.
+build the same image content. Compatibility evidence covers the forms exercised
+by the tests and reviews.
 
 ### Known, unchanged
 

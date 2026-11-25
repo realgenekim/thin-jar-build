@@ -8,7 +8,7 @@
    (com.google.cloud.tools.jib.api.buildplan AbsoluteUnixPath FileEntriesLayer)
    (com.google.cloud.tools.jib.frontend CredentialRetrieverFactory)
    (java.io File)
-   (java.util ArrayList Collection List Set)
+   (java.util ArrayList Collection List Map Set)
    (java.util.function Consumer)))
 
 (def version "The thin-jar-build library version." "0.2.0")
@@ -77,16 +77,14 @@
     (catch IllegalArgumentException _
       nil)))
 
-(defn- validate-source! [layer path allowed source-key]
-  (let [source-path (conj path source-key)
-        ^File source (source-file (get layer source-key))
-        jar? (= source-key :jar-path)]
+(defn- validate-jar-source! [jar-path path allowed]
+  (let [^File source (source-file jar-path)
+        source-path (conj path :jar-path)]
     (when-not (and source (.exists source))
-      (invalid-config! :source-not-found source-path allowed [source-key]))
-    (when-not (if jar? (.isFile source) (.isDirectory source))
-      (invalid-config! :wrong-source-kind source-path allowed [source-key]
-                       {:expected-kind (if jar? :regular-file :directory)}))
-    source))
+      (invalid-config! :source-not-found source-path allowed [:jar-path]))
+    (when-not (.isFile source)
+      (invalid-config! :wrong-source-kind source-path allowed [:jar-path]
+                       {:expected-kind :regular-file}))))
 
 (defn- non-map-collection? [value]
   (and (or (coll? value) (instance? Collection value))
@@ -99,31 +97,42 @@
 (defn- string-collection? [value]
   (and (collection-or-array? value) (every? string? value)))
 
-(defn- validate-file-filters! [{:keys [names extensions blacklist-prefixes] :as layer}
+(defn- validate-file-filters! [{:keys [names extensions blacklist-prefixes]}
                                path allowed]
-  (when (and (some? names) (not (string-collection? names)))
+  (when (or (string? names) (keyword? names))
     (invalid-value! (conj path :names) allowed))
-  (when (and (contains? layer :extensions) (not (string-collection? extensions)))
+  (when (and (some? extensions) (not (string-collection? extensions)))
     (invalid-value! (conj path :extensions) allowed))
   (when-not (and (seqable? blacklist-prefixes) (every? string? blacklist-prefixes))
     (invalid-value! (conj path :blacklist-prefixes) allowed)))
+
+(defn- container-path-value
+  "f5bd8dd and the fork used any container path through its text form (File, Path, ...)."
+  [value]
+  (cond
+    (instance? File value) (.getPath ^File value)
+    (or (nil? value) (string? value)) value
+    :else (str value)))
 
 (defn- validate-layer! [index layer]
   (let [path [:layers index]
         type-path (conj path :type)]
     (when-not (map? layer)
       (invalid-config! :expected-map path #{:type}))
+    (when-not (some #{:type} (keys layer))
+      (validate-keys! layer path {:allowed #{:type} :required #{:type}}))
     (let [{:keys [type]} layer
-          {:keys [allowed source-key] :as contract} (get-in spec-contract [:layers type])]
+          {:keys [allowed] :as contract} (get-in spec-contract [:layers type])]
       (cond
         (nil? type) (invalid-config! :missing-required-key type-path #{:type} [:type])
         (nil? contract) (invalid-config! :unknown-layer-type type-path #{:type} [:type]))
       (validate-keys! layer path contract)
-      (let [container-path (:container-path layer)]
+      (let [container-path (container-path-value (:container-path layer))]
         (when-not (or (and (not= :app type) (contains? #{nil ""} container-path))
                       (and (string? container-path) (str/starts-with? container-path "/")))
           (invalid-value! (conj path :container-path) allowed)))
-      (validate-source! layer path allowed source-key)
+      (when (= :app type)
+        (validate-jar-source! (:jar-path layer) path allowed))
       (when (= :files type)
         (validate-file-filters! layer path allowed)))))
 
@@ -178,32 +187,13 @@
         (validate-image! (:image base) [:base :image] (:allowed contract))
         (when-not (nonblank-string? (:reason base))
           (invalid-config! :invalid-base [:base :reason] (:allowed contract) [:reason]))))
-    (when (contains? spec :base-image)
+    (when (and (contains? spec :base-image) (not (instance? ImageReference (:base-image spec))))
       (validate-image! (:base-image spec) [:base-image] allowed))))
 
-(defn- normalize-legacy-layer
-  "Convert legacy value forms that f5bd8dd accepted into the forms validation expects."
-  [layer]
-  (cond-> layer
-    (and (map? layer) (instance? File (:container-path layer)))
-    (update :container-path #(.getPath ^File %))
-    (and (map? layer) (contains? layer :extensions) (nil? (:extensions layer)))
-    (assoc :extensions #{})))
-
-(defn- normalize-legacy-values
-  "A java.io.File container path, an ImageReference base image and :extensions nil (an empty
-   selection) all worked at f5bd8dd; normalize them before validation."
-  [spec]
-  (cond-> spec
-    (instance? ImageReference (:base-image spec)) (update :base-image str)
-    (collection-or-array? (:layers spec)) (update :layers #(mapv normalize-legacy-layer %))))
-
 (defn validate-spec!
-  "Return the (normalized) spec if its configuration and layer sources are valid. Throw ex-info
-   otherwise."
+  "Return the original spec if its configuration and app source are valid. Throw ex-info otherwise."
   [spec]
-  (let [spec (normalize-legacy-values spec)
-        {:keys [allowed] :as contract} (:top spec-contract)]
+  (let [{:keys [allowed] :as contract} (:top spec-contract)]
     (validate-keys! spec [] contract)
     (validate-destination! spec allowed)
     (validate-base! spec allowed)
@@ -234,47 +224,56 @@
   {:source (.getAbsolutePath file)
    :container-path (str (AbsoluteUnixPath/get container-path))})
 
-(defn- directory-entries [dir container-path include?]
-  (for [^File file (.listFiles (io/file dir))
-        :when (and (.isFile file) (include? (.getName file)))]
-    (file-entry file (str container-path "/" (.getName file)))))
-
-(defn- as-filter-set [values]
-  (if (instance? Set values) values (set values)))
-
-(defn- plan-layer [index {:keys [type lib-dir jar-path local-dir container-path extensions blacklist-prefixes names]
-                          :or {extensions #{".py" ".txt" ".sh" ".json" ".yaml" ".yml"}
-                               blacklist-prefixes []}}]
-  (let [extensions (as-filter-set extensions)
-        names (some-> names as-filter-set)
-        [name entries]
-        (case type
-          :deps ["dependencies" (directory-entries lib-dir container-path (constantly true))]
-          :app ["application" [(file-entry (io/file jar-path) container-path)]]
-          :files [(str "files:" local-dir)
-                  (directory-entries local-dir container-path
-                                     (fn [filename]
-                                       (and (some #(str/ends-with? filename %) extensions)
-                                            (or (nil? names) (contains? names filename))
-                                            (not-any? #(str/starts-with? filename %) blacklist-prefixes))))])
-        entries (vec entries)]
+(defn- plan-directory [index type name source container-path include? filters]
+  (let [^File dir (source-file source)
+        files (filter #(.isFile ^File %) (when dir (.listFiles dir)))
+        entries (into []
+                      (comp (filter #(include? (.getName ^File %)))
+                            (map #(file-entry % (str container-path "/" (.getName ^File %)))))
+                      files)]
     (cond-> {:type type :name name :entries entries}
       (empty? entries)
       (assoc :empty-layer {:index index
                            :type type
-                           :source (or lib-dir local-dir)
-                           :filters (if (= :files type)
-                                      {:extensions extensions
-                                       :names names
-                                       :blacklist-prefixes (vec blacklist-prefixes)}
-                                      {})}))))
+                           :source source
+                           :cause (cond
+                                    (not (and dir (.exists dir))) :missing
+                                    (not (.isDirectory dir)) :not-a-directory
+                                    (empty? files) :empty
+                                    :else :filtered)
+                           :filters filters}))))
+
+(defn- as-filter-set [values]
+  (if (instance? Set values) values (set values)))
+
+(defn- names-membership [names]
+  (cond
+    (or (nil? names) (instance? Map names) (instance? Set names)) names
+    (collection-or-array? names) (set names)
+    :else #{}))
+
+(defn- plan-layer [index {:keys [type lib-dir jar-path local-dir container-path extensions blacklist-prefixes names]
+                          :or {extensions #{".py" ".txt" ".sh" ".json" ".yaml" ".yml"}
+                               blacklist-prefixes []}}]
+  (let [container-path (container-path-value container-path)]
+    (case type
+      :deps (plan-directory index type "dependencies" lib-dir container-path (constantly true) {})
+      :app {:type type :name "application" :entries [(file-entry (io/file jar-path) container-path)]}
+      :files (let [extensions (as-filter-set extensions)
+                   names (names-membership names)]
+               (plan-directory index type (str "files:" local-dir) local-dir container-path
+                               (fn [filename]
+                                 (and (some #(str/ends-with? filename %) extensions)
+                                      (or (nil? names) (contains? names filename))
+                                      (not-any? #(str/starts-with? filename %) blacklist-prefixes)))
+                               {:extensions extensions
+                                :names names
+                                :blacklist-prefixes (vec blacklist-prefixes)})))))
 
 (defn- library-labels [base]
-  {base-label (:image base)})
+  {base-label (str (:image base))})
 
-(defn plan
-  "Validate a spec and resolve its destination, base and layer entries using local files."
-  [spec]
+(defn- plan-spec [spec]
   (let [{:keys [to target-image to-tar base base-image entrypoint env labels layers verbose]
          :or {base-image default-base verbose true}} (validate-spec! spec)
         base (or base {:image base-image :legacy true})
@@ -290,6 +289,11 @@
      :layers (mapv #(dissoc % :empty-layer) planned-layers)
      :empty-layers (into [] (keep :empty-layer) planned-layers)
      :verbose verbose}))
+
+(defn plan
+  "Validate a spec and resolve its destination, base and layer entries using local files."
+  [spec]
+  (update-in (plan-spec spec) [:base :image] str))
 
 (defn- make-containerizer [target-image to-tar logger]
   (if to-tar
@@ -312,7 +316,8 @@
   (if (and (= "scratch" (:image base)) (not (:legacy base)))
     (Jib/fromScratch)
     (Jib/from
-      (-> (RegistryImage/named ^String (:image base))
+      (-> (RegistryImage/named ^ImageReference (let [image (:image base)]
+                                                 (if (instance? ImageReference image) image (to-imgref image))))
           (.addCredentialRetriever
             (-> (CredentialRetrieverFactory/forImage (to-imgref target-image) logger)
                 (.dockerConfig)))))))
@@ -324,9 +329,9 @@
   (let [{:keys [registry tar image-name]} destination
         target-image (or registry image-name)
         logger (make-logger verbose)]
-    (doseq [{:keys [index type source filters]} empty-layers]
+    (doseq [{:keys [index type source cause filters]} empty-layers]
       (println (str "WARNING thin-jar: layer " index " (" type " " source
-                    ") selects no files; filters: " filters)))
+                    ") selects no files (" cause "); filters: " filters)))
     (println (if tar
                "Building container image tarball with Jib (no push)..."
                "Building and pushing container image with Jib..."))
@@ -357,7 +362,7 @@
          :pushed? (.isImagePushed result)
          :image-digest (str (.getDigest result))
          :image-id (str (.getImageId result))
-         :base (select-keys base [:image])
+         :base {:image (str (:image base))}
          :labels labels
          :library-version version}))))
 
@@ -365,7 +370,7 @@
   "Build the validated image and return a receipt. Legacy destination keys retain
    the fork's receipt fields and expose the normalized map as :resolved-destination."
   [spec]
-  (let [{:keys [destination image-digest] :as receipt} (execute-plan! (plan spec) (:layers spec))]
+  (let [{:keys [destination image-digest] :as receipt} (execute-plan! (plan-spec spec) (:layers spec))]
     (if (contains? spec :to)
       receipt
       (let [{:keys [registry tar image-name]} destination]

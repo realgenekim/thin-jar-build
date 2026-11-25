@@ -66,7 +66,7 @@ Options:
 credential lookup or image building. Errors report the reason, path, allowed
 keys, and offending keys.
 
-| Scope | Allowed keys | Required keys | Existing local source |
+| Scope | Allowed keys | Required keys | Local source key |
 | --- | --- | --- | --- |
 | top | `:entrypoint`, `:layers`, `:to`, `:target-image`, `:to-tar`, `:base`, `:base-image`, `:env`, `:labels`, `:verbose` | `:entrypoint`, `:layers`, and a destination | |
 | to | `:registry`, `:tar`, `:image-name` | `:registry` alone, or `:tar` and `:image-name` | |
@@ -85,13 +85,16 @@ A `:deps` layer includes every regular file directly in `:lib-dir`. A `:files`
 layer selects regular files directly in `:local-dir` using a collection or array of
 extensions (default `.py`, `.txt`, `.sh`, `.json`, `.yaml`, `.yml`). It then
 applies the optional exact filename allowlist `:names` and the optional exclusion
-list `:blacklist-prefixes`. The allowlist accepts a collection or array of
-strings and may include absent files. Sets retain their own membership rules.
+list `:blacklist-prefixes`. Maps match by key and sets retain their own
+membership rules, including sets with non-string members. Vectors, lists, and
+Java arrays match by element. Allowlists may include absent files. A string or
+keyword alone is invalid.
 Credential logging defaults to enabled. Only false and nil disable it.
 
-Planning rejects unknown keys, missing or wrong-kind sources, malformed values
-such as a string entrypoint or an unparseable image reference, and conflicting
-or missing destinations.
+Planning rejects unknown keys, a conflicting or missing destination, an app
+JAR whose path is missing or does not point to a regular file, a string,
+empty, or non-string entrypoint, an image reference Jib cannot parse, an empty
+non-map collection of layers, and a relative container path.
 
 ### Destination and base
 
@@ -120,13 +123,15 @@ or contacting a registry. It includes the normalized `:destination`, `:base`
 and the ordered `:layers`. Each layer includes its type, name and entries with
 absolute local `:source` paths and resolved `:container-path` values.
 The plan and both receipt shapes include `:empty-layers`, a vector with
-`{:index i :type t :source dir :filters {...}}` for each directory layer that
-selects no files. The vector is empty when every layer has entries.
+`{:index i :type t :source dir :cause cause :filters {...}}` for each directory
+layer that contributes zero files. The cause is `:missing` if the source path
+does not exist, `:not-a-directory` if the source is a file, `:empty` if the
+directory has no files, or `:filtered` if filters excluded every file.
 Jib drops empty layers. Before building, `deploy!` prints one line per empty
 layer even when `:verbose` is false or nil.
 
 ```text
-WARNING thin-jar: layer <i> (<type> <source>) selects no files; filters: <filters>
+WARNING thin-jar: layer <i> (<type> <source>) selects no files (<cause>); filters: <filters>
 ```
 
 `(jib/deploy! spec)` executes that plan. With `:to` it returns this receipt shape:

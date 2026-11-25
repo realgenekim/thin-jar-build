@@ -248,24 +248,70 @@
             (is (= [:layers 0 key] (:path data)))
             (is (= expected (:expected-kind data)))))))))
 
+(deftest old-forms-still-plan
+  (with-specs
+    (fn [{:keys [app deps files]} _]
+      (doseq [extensions [[".py"] '(".py") #{".py"}]]
+        (is (= #{"/scripts/main.py" "/scripts/test_skip.py"}
+               (container-paths (assoc-in files [:layers 0 :extensions] extensions)))))
+      (doseq [names [["main.py" "optional.py"] '("main.py" "optional.py")
+                     #{"main.py" "optional.py"}]]
+        (is (= #{"/scripts/main.py"}
+               (container-paths (assoc-in files [:layers 0 :names] names)))))
+      (is (= (jib/plan files) (jib/plan (assoc-in files [:layers 0 :names] nil))))
+      (doseq [spec [deps files]
+              update-path [#(dissoc % :container-path)
+                           #(assoc % :container-path nil)
+                           #(assoc % :container-path "")]]
+        (let [expected (if (= spec deps)
+                         #{"/app.jar" "/other.jar" "/main.py" "/test_skip.py" "/notes.txt" "/other.rb"}
+                         #{"/main.py" "/test_skip.py" "/notes.txt"})]
+          (is (= expected (container-paths (update-in spec [:layers 0] update-path))))))
+      (doseq [[entrypoint expected] [[[] []] [#{"java"} ["java"]]
+                                     [(into-array String ["java"]) ["java"]]]]
+        (let [spec (assoc app :entrypoint entrypoint :verbose nil)
+              planned (jib/plan spec)]
+          (is (= expected (:entrypoint planned)))
+          (is (nil? (:verbose planned)))
+          (is (= #{"/app.jar"} (container-paths spec)))))
+      (is (= (jib/plan app) (jib/plan (update app :layers object-array)))))))
+
+(deftest empty-layers-are-refused
+  (with-specs
+    (fn [{:keys [app deps files]} dir]
+      (let [empty-dir (str (io/file dir "empty"))
+            deps-layer (assoc (first (:layers deps)) :lib-dir empty-dir)
+            files-layer (first (:layers files))
+            default-extensions #{".py" ".txt" ".sh" ".json" ".yaml" ".yml"}]
+        (.mkdir (io/file empty-dir))
+        (doseq [[layer source extensions names blacklist]
+                [[deps-layer empty-dir nil nil nil]
+                 [(assoc files-layer :local-dir empty-dir) empty-dir default-extensions nil []]
+                 [(assoc files-layer :extensions []) (str dir) #{} nil []]
+                 [(assoc files-layer :extensions #{".pyy"}) (str dir) #{".pyy"} nil []]
+                 [(assoc files-layer :names ["absent.py"]) (str dir) default-extensions #{"absent.py"} []]
+                 [(assoc files-layer :names #{}) (str dir) default-extensions #{} []]
+                 [(assoc files-layer :names #{"other.rb"}) (str dir) default-extensions #{"other.rb"} []]
+                 [(assoc files-layer :names #{"test_skip.py"} :blacklist-prefixes ["test_"])
+                  (str dir) default-extensions #{"test_skip.py"} ["test_"]]
+                 [(assoc files-layer :blacklist-prefixes [""]) (str dir) default-extensions nil [""]]]]
+          (let [spec (update app :layers conj layer)
+                data (ex-data (config-error jib/plan spec))]
+            (is (= [:empty-layer [:layers 1] (:type layer) source extensions names blacklist]
+                   ((juxt :reason :path :layer-type :source-directory :extensions :names :blacklist-prefixes)
+                    data)))))))))
+
 (deftest file-filters-are-validated
   (with-specs
-    (fn [{:keys [files]} dir]
-      (.mkdir (io/file dir "folder.py"))
-      (doseq [[key values] {:names [["main.py"] '("main.py") "main.py" #{:main.py} #{" "}]
-                            :extensions [nil #{} #{:py} [".py"] ".py"]
+    (fn [{:keys [files]} _]
+      (doseq [[key values] {:names ["main.py" #{:main.py} {"main.py" true}]
+                            :extensions [nil #{:py} ".py" {".py" true}]
                             :blacklist-prefixes ["main" [:main]]}
               value values]
         (testing (pr-str [key value])
           (let [path [:layers 0 key]
                 data (ex-data (config-error jib/plan (assoc-in files path value)))]
             (is (= [:invalid-value path] ((juxt :reason :path) data))))))
-      (let [path [:layers 0 :names]
-            data (ex-data (config-error jib/plan
-                                        (assoc-in files path #{"main.py" "mian.py" "folder.py"})))]
-        (is (= [:source-not-found path ["folder.py" "mian.py"]]
-               ((juxt :reason :path :missing-names) data))))
-      (is (= (jib/plan files) (jib/plan (assoc-in files [:layers 0 :names] nil))))
       (is (= #{"/scripts/main.py"}
              (container-paths (-> files
                                   (assoc-in [:layers 0 :names] #{"main.py"})
@@ -273,11 +319,10 @@
 
 (deftest spec-values-are-validated
   (with-specs
-    (fn [{:keys [app deps files]} dir]
+    (fn [{:keys [app deps files]} _]
       (let [modern (modern-destination app)]
-        (.mkdir (io/file dir "empty"))
         (doseq [[spec path values]
-                [[app [:entrypoint] ["java" [] [:java 1] nil]]
+                [[app [:entrypoint] ["java" [:java 1] nil]]
                  [app [:target-image] [nil :oops " " "NOT A REF"]]
                  [modern [:to :registry] ["https://example.invalid/image" "NOT A REF"]]
                  [(assoc modern :to {:tar "out.tar" :image-name "image:local"})
@@ -287,14 +332,13 @@
                  [(assoc app :base {:image "scratch" :reason "Fixture"})
                   [:base :image] [nil "NOT A REF"]]
                  [app [:base-image] [nil "NOT A REF"]]
-                 [app [:verbose] ["false" nil 1]]
+                 [app [:verbose] ["false" 1]]
                  [app [:to-tar] [nil " " 1]]
                  [app [:env] [{"KEY" 1} [:key "value"]]]
                  [app [:labels] [nil {:key "value"}]]
                  [app [:layers 0 :container-path] ["rel/app.jar" "" 5]]
-                 [(assoc-in deps [:layers 0 :lib-dir] (str (io/file dir "empty")))
-                  [:layers 0 :container-path] [nil "relative"]]
-                 [files [:layers 0 :container-path] ["" "relative"]]]
+                 [deps [:layers 0 :container-path] ["relative"]]
+                 [files [:layers 0 :container-path] ["relative"]]]
                 value values]
           (testing (pr-str [path value])
             (let [updated (assoc-in spec path value)]
@@ -306,10 +350,9 @@
         (is (= (jib/plan app) (jib/plan (update app :entrypoint #(ArrayList. %)))))
         (is (= {:image "scratch" :legacy true}
                (:base (jib/plan (assoc app :base-image "scratch")))))
-        (doseq [spec [deps files]]
-          (let [data (ex-data (config-error jib/plan (update-in spec [:layers 0] dissoc :container-path)))]
-            (is (= [:missing-required-key [:layers 0 :container-path]]
-                   ((juxt :reason :path) data)))))))))
+        (let [data (ex-data (config-error jib/plan (update-in app [:layers 0] dissoc :container-path)))]
+          (is (= [:missing-required-key [:layers 0 :container-path]]
+                 ((juxt :reason :path) data))))))))
 
 (deftest layer-collections-are-compatible
   (with-specs
@@ -489,5 +532,5 @@
 (deftest release-notes-cover-compatibility
   (let [changelog (slurp "CHANGELOG.md")]
     (is (re-find #"(?s)### Behaviour changes.*`deploy!`.*receipt.*nil" changelog))
-    (is (re-find #"(?s)### Behaviour changes.*unknown keys.*wrong-kind.*invalid values.*:names.*:container-path.*image root" changelog))
+    (is (re-find #"(?s)### Behaviour changes.*unknown keys.*wrong-kind.*invalid values.*contain no files.*:container-path.*image root" changelog))
     (is (re-find #"(?s)### Known, unchanged.*credential.*target image's registry.*f5bd8dd.*fork" changelog))))

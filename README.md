@@ -71,16 +71,24 @@ keys, and offending keys.
 | top | `:entrypoint`, `:layers`, `:to`, `:target-image`, `:to-tar`, `:base`, `:base-image`, `:env`, `:labels`, `:verbose` | `:entrypoint`, `:layers`, and a destination | |
 | to | `:registry`, `:tar`, `:image-name` | `:registry` alone, or `:tar` and `:image-name` | |
 | base | `:image`, `:reason` | `:image`, `:reason` | |
-| deps | `:type`, `:lib-dir`, `:container-path` | `:type`, `:lib-dir`, `:container-path` | `:lib-dir` |
+| deps | `:type`, `:lib-dir`, `:container-path` | `:type`, `:lib-dir` | `:lib-dir` |
 | app | `:type`, `:jar-path`, `:container-path` | `:type`, `:jar-path`, `:container-path` | `:jar-path` |
-| files | `:type`, `:local-dir`, `:container-path`, `:extensions`, `:blacklist-prefixes`, `:names` | `:type`, `:local-dir`, `:container-path` | `:local-dir` |
+| files | `:type`, `:local-dir`, `:container-path`, `:extensions`, `:blacklist-prefixes`, `:names` | `:type`, `:local-dir` | `:local-dir` |
 
-`:entrypoint` is a sequence of strings, and `:layers` is a non-empty sequence in
-build order. Container paths are absolute Unix paths. A `:deps` layer includes
-every regular file directly in `:lib-dir`. A `:files` layer selects regular files
-directly in `:local-dir` by extension (default `.py`, `.txt`, `.sh`, `.json`,
-`.yaml`, `.yml`), then applies the optional exact filename set `:names` and the
-optional exclusion list `:blacklist-prefixes`. Jib logging defaults to enabled.
+`:entrypoint` takes a collection or array of strings and may be empty. `:layers`
+takes a non-empty collection or array in build order. Container paths are absolute
+Unix paths. For directory layers, an omitted, nil, or empty `:container-path`
+means the image root `/`.
+
+A `:deps` layer includes every regular file directly in `:lib-dir`. A `:files`
+layer selects regular files directly in `:local-dir` using a collection of
+extensions (default `.py`, `.txt`, `.sh`, `.json`, `.yaml`, `.yml`). It then
+applies the optional exact filename allowlist `:names` and the optional exclusion
+list `:blacklist-prefixes`. The allowlist may include absent files. Credential
+logging defaults to enabled. Set `:verbose` to false or nil to disable it.
+
+Planning rejects unknown keys, missing or wrong-kind sources, invalid values,
+and directory layers that would contain no files.
 
 ### Destination and base
 

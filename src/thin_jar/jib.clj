@@ -26,13 +26,13 @@
         :alternatives {:registry #{:registry}
                        :tar #{:tar :image-name}}}
    :layers {:deps {:allowed #{:type :lib-dir :container-path}
-                   :required #{:type :lib-dir :container-path}
+                   :required #{:type :lib-dir}
                    :source-key :lib-dir}
             :app {:allowed #{:type :jar-path :container-path}
                   :required #{:type :jar-path :container-path}
                   :source-key :jar-path}
             :files {:allowed #{:type :local-dir :container-path :extensions :blacklist-prefixes :names}
-                    :required #{:type :local-dir :container-path}
+                    :required #{:type :local-dir}
                     :source-key :local-dir}}})
 
 (defn- invalid-config! [reason path allowed & [offending details]]
@@ -40,8 +40,6 @@
         environment? (and (= reason :unknown-key) (empty? path)
                           (some #{:environment} offending))]
     (throw (ex-info (str "Invalid Jib configuration " (pr-str reason) " at " (pr-str path)
-                         (when-let [missing-names (:missing-names details)]
-                           (str ". Missing files: " (pr-str missing-names)))
                          (when environment?
                            ". Use :env to add or override individual variables. The :environment key of another fork sets the whole environment map on the Jib builder and enforces JVM flags, so it is not accepted as an alias."))
                     (merge {:type ::invalid-config
@@ -90,22 +88,25 @@
                        {:expected-kind (if jar? :regular-file :directory)}))
     source))
 
+(defn- non-map-collection? [value]
+  (and (or (coll? value) (instance? Collection value))
+       (not (map? value))))
+
+(defn- collection-or-array? [value]
+  (or (non-map-collection? value)
+      (and (some? value) (.isArray (class value)))))
+
+(defn- string-collection? [value]
+  (and (non-map-collection? value) (every? string? value)))
+
 (defn- validate-file-filters! [{:keys [names extensions blacklist-prefixes] :as layer}
-                               ^File source path allowed]
-  (when (and (some? names) (not (and (set? names) (every? nonblank-string? names))))
+                               path allowed]
+  (when (and (some? names) (not (string-collection? names)))
     (invalid-value! (conj path :names) allowed))
-  (when (and (contains? layer :extensions)
-             (not (and (set? extensions) (seq extensions) (every? string? extensions))))
+  (when (and (contains? layer :extensions) (not (string-collection? extensions)))
     (invalid-value! (conj path :extensions) allowed))
   (when-not (and (seqable? blacklist-prefixes) (every? string? blacklist-prefixes))
-    (invalid-value! (conj path :blacklist-prefixes) allowed))
-  (when (seq names)
-    (let [files (into #{} (comp (filter #(.isFile ^File %)) (map #(.getName ^File %)))
-                      (.listFiles source))
-          missing (seq (sort (remove files names)))]
-      (when missing
-        (invalid-config! :source-not-found (conj path :names) allowed [:names]
-                         {:missing-names (vec missing)})))))
+    (invalid-value! (conj path :blacklist-prefixes) allowed)))
 
 (defn- validate-layer! [index layer]
   (let [path [:layers index]
@@ -119,11 +120,12 @@
         (nil? contract) (invalid-config! :unknown-layer-type type-path #{:type} [:type]))
       (validate-keys! layer path contract)
       (let [container-path (:container-path layer)]
-        (when-not (and (nonblank-string? container-path) (str/starts-with? container-path "/"))
+        (when-not (or (and (not= :app type) (contains? #{nil ""} container-path))
+                      (and (string? container-path) (str/starts-with? container-path "/")))
           (invalid-value! (conj path :container-path) allowed)))
-      (let [source (validate-source! layer path allowed source-key)]
-        (when (= :files type)
-          (validate-file-filters! layer source path allowed))))))
+      (validate-source! layer path allowed source-key)
+      (when (= :files type)
+        (validate-file-filters! layer path allowed)))))
 
 (defn- to-imgref [image-config]
   (ImageReference/parse image-config))
@@ -187,13 +189,11 @@
     (validate-destination! spec allowed)
     (validate-base! spec allowed)
     (let [{:keys [entrypoint layers env labels verbose]} spec]
-      (when-not (and (or (sequential? entrypoint) (instance? List entrypoint))
-                     (seq entrypoint) (every? string? entrypoint))
+      (when-not (and (collection-or-array? entrypoint) (every? string? entrypoint))
         (invalid-value! [:entrypoint] allowed))
-      (when-not (and (or (coll? layers) (instance? Collection layers))
-                     (not (map? layers)) (seq layers))
+      (when-not (and (collection-or-array? layers) (seq layers))
         (invalid-config! :invalid-layers [:layers] allowed [:layers]))
-      (when (and (contains? spec :verbose) (not (boolean? verbose)))
+      (when (and (some? verbose) (not (boolean? verbose)))
         (invalid-value! [:verbose] allowed))
       (when (and (some? env) (not (string-map? env)))
         (invalid-value! [:env] allowed))
@@ -222,10 +222,12 @@
         :when (and (.isFile file) (include? (.getName file)))]
     (file-entry file (str container-path "/" (.getName file)))))
 
-(defn- plan-layer [{:keys [type lib-dir jar-path local-dir container-path extensions blacklist-prefixes names]
-                    :or {extensions #{".py" ".txt" ".sh" ".json" ".yaml" ".yml"}
-                         blacklist-prefixes []}}]
-  (let [[name entries]
+(defn- plan-layer [index {:keys [type lib-dir jar-path local-dir container-path extensions blacklist-prefixes names]
+                          :or {extensions #{".py" ".txt" ".sh" ".json" ".yaml" ".yml"}
+                               blacklist-prefixes []}}]
+  (let [extensions (set extensions)
+        names (when (some? names) (set names))
+        [name entries]
         (case type
           :deps ["dependencies" (directory-entries lib-dir container-path (constantly true))]
           :app ["application" [(file-entry (io/file jar-path) container-path)]]
@@ -234,10 +236,18 @@
                                      (fn [filename]
                                        (and (some #(str/ends-with? filename %) extensions)
                                             (or (nil? names) (contains? names filename))
-                                            (not-any? #(str/starts-with? filename %) blacklist-prefixes))))])]
+                                            (not-any? #(str/starts-with? filename %) blacklist-prefixes))))])
+        entries (vec entries)]
+    (when (empty? entries)
+      (invalid-config! :empty-layer [:layers index] (get-in spec-contract [:layers type :allowed])
+                       nil (merge {:layer-type type :source-directory (or lib-dir local-dir)}
+                                  (when (= :files type)
+                                    {:extensions extensions
+                                     :names names
+                                     :blacklist-prefixes blacklist-prefixes}))))
     {:type type
      :name name
-     :entries (vec entries)}))
+     :entries entries}))
 
 (defn- library-labels [base]
   {base-label (:image base)})
@@ -256,7 +266,7 @@
      :entrypoint (vec entrypoint)
      :env (or env {})
      :labels (merge labels (library-labels base))
-     :layers (mapv plan-layer layers)
+     :layers (mapv plan-layer (range) layers)
      :verbose verbose}))
 
 (defn- make-containerizer [target-image to-tar logger]

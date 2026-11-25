@@ -22,9 +22,8 @@
 
 - `deploy!` returns a receipt. At `f5bd8dd` it returned nil.
 - Planning rejects unknown keys, missing or wrong-kind sources, invalid values,
-  and a `:names` entry that matches no file in `:local-dir`.
-- A directory layer requires an absolute `:container-path`. Upstream placed
-  files from directory layers with an omitted path at the image root.
+  and directory layers that would contain no files.
+- An omitted, nil, or empty directory-layer `:container-path` means the image root `/`.
 
 ### Known, unchanged
 

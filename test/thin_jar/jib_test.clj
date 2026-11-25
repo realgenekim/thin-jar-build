@@ -614,3 +614,20 @@
                                                       :extensions #{".none"}
                                                       :blacklist-prefixes (into-array String ["test_"])))]
           (is (= ["test_"] (get-in (jib/plan spec) [:empty-layers 0 :filters :blacklist-prefixes]))))))))
+
+(deftest malformed-layers-get-precise-reasons
+  (with-specs
+    (fn [{:keys [deps files]} dir]
+      (let [layer (first (:layers deps))
+            reason (fn [spec] ((juxt :reason :path) (ex-data (config-error jib/plan spec))))]
+        (is (= [:missing-required-key [:layers 0 :type]]
+               (reason (assoc deps :layers [(dissoc layer :type)]))))
+        (doseq [bad [42 nil :dir]]
+          (is (= [:invalid-value [:layers 0 :lib-dir]]
+                 (reason (assoc-in deps [:layers 0 :lib-dir] bad)))))
+        (doseq [bad [42 true 'sym]]
+          (is (= [:invalid-value [:layers 0 :names]]
+                 (reason (assoc-in files [:layers 0 :names] bad)))))
+        (is (= [] (:empty-layers (jib/plan (assoc-in deps [:layers 0 :lib-dir] dir)))))
+        (doseq [names [(transient {"main.py" true}) (transient #{"main.py"})]]
+          (is (= #{"/scripts/main.py"} (container-paths (assoc-in files [:layers 0 :names] names)))))))))

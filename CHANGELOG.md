@@ -20,16 +20,24 @@
 ### Behaviour changes
 
 - `deploy!` returns a receipt. At `f5bd8dd` it returned nil.
-- Validation reports a typed `ex-info` for unknown keys, a conflicting or
-  missing destination, an app JAR whose path is missing or does not point to a
-  regular file, a string, empty, or non-string entrypoint, an image reference
-  Jib cannot parse, an empty non-map collection of layers, and a relative
-  container path.
+- Validation refuses, with a typed `ex-info` `:reason` before any build or push,
+  values that never produced a correct image: unknown keys or an unknown layer
+  type; a missing required key; a non-map spec or layer; a conflicting or
+  missing destination; an app JAR whose path is missing or does not point to a
+  regular file; a string, empty, or non-string entrypoint; an image reference
+  Jib cannot parse; an empty collection of layers; a relative container path;
+  a directory source that is not a string or `File`; and malformed values:
+  `:names` that is not a collection, array or map, `:extensions` or
+  `:blacklist-prefixes` that is not a collection or array of strings,
+  non-string `:env` or `:labels`, the reserved base label, a blank `:base`
+  `:reason`. A malformed filter was refused even where `f5bd8dd` built an
+  image only because the directory was empty or absent, so no file reached it.
 - Vector, list and Java-array `:names` allowlists now match filenames by value
   (the fork's `contains?` did not match their elements). This is additive.
   Maps match by key and sets keep their existing membership rules.
-- Still accepted as at `f5bd8dd`: a directory `:container-path` given as any
-  object whose text form is an absolute path (`java.io.File`, `java.nio.file.Path`),
+- Still accepted as at `f5bd8dd`: a `:container-path` given as any object whose
+  text form is an absolute path (`java.io.File`, `java.nio.file.Path`), a
+  `java.io.File` `:jar-path`,
   an `ImageReference` `:base-image`, and `:extensions nil` (an empty selection,
   reported below).
 - A directory layer that contributes zero files reports its cause as `:missing`

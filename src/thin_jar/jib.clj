@@ -97,14 +97,28 @@
 (defn- string-collection? [value]
   (and (collection-or-array? value) (every? string? value)))
 
+(defn- membership-as-given?
+  "Maps, sets and their transients answer contains? themselves, as in the fork."
+  [names]
+  (or (instance? Map names) (instance? Set names)
+      (instance? clojure.lang.ITransientAssociative names)
+      (instance? clojure.lang.ITransientSet names)))
+
 (defn- validate-file-filters! [{:keys [names extensions blacklist-prefixes]}
                                path allowed]
-  (when (or (string? names) (keyword? names))
+  (when-not (or (nil? names) (membership-as-given? names) (collection-or-array? names))
     (invalid-value! (conj path :names) allowed))
   (when (and (some? extensions) (not (string-collection? extensions)))
     (invalid-value! (conj path :extensions) allowed))
   (when-not (and (seqable? blacklist-prefixes) (every? string? blacklist-prefixes))
     (invalid-value! (conj path :blacklist-prefixes) allowed)))
+
+(defn- str-or-file
+  "A directory source as text: a string, or a File's path. Anything else is nil (never a valid source)."
+  [value]
+  (cond (string? value) value
+        (instance? File value) (.getPath ^File value)
+        :else nil))
 
 (defn- container-path-value
   "f5bd8dd and the fork used any container path through its text form (File, Path, ...)."
@@ -119,7 +133,7 @@
         type-path (conj path :type)]
     (when-not (map? layer)
       (invalid-config! :expected-map path #{:type}))
-    (when-not (some #{:type} (keys layer))
+    (when-not (every? keyword? (keys layer))
       (validate-keys! layer path {:allowed #{:type} :required #{:type}}))
     (let [{:keys [type]} layer
           {:keys [allowed] :as contract} (get-in spec-contract [:layers type])]
@@ -133,6 +147,10 @@
           (invalid-value! (conj path :container-path) allowed)))
       (when (= :app type)
         (validate-jar-source! (:jar-path layer) path allowed))
+      (doseq [source-key [:lib-dir :local-dir]
+              :when (and (contains? (get-in spec-contract [:layers type :allowed]) source-key)
+                         (not (nonblank-string? (str-or-file (get layer source-key)))))]
+        (invalid-value! (conj path source-key) allowed))
       (when (= :files type)
         (validate-file-filters! layer path allowed)))))
 
@@ -248,7 +266,7 @@
 
 (defn- names-membership [names]
   (cond
-    (or (nil? names) (instance? Map names) (instance? Set names)) names
+    (or (nil? names) (membership-as-given? names)) names
     (collection-or-array? names) (set names)
     :else #{}))
 

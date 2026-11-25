@@ -1,14 +1,18 @@
 (ns thin-jar.jib-test
   (:require
+   [clojure.edn :as edn]
    [clojure.java.io :as io]
+   [clojure.string :as str]
    [clojure.test :refer [deftest is testing]]
    [thin-jar.jib :as jib])
   (:import
    (com.fasterxml.jackson.databind ObjectMapper)
    (com.google.cloud.tools.jib.api Containerizer)
-   (java.io ByteArrayInputStream PushbackReader)
+   (java.io ByteArrayInputStream)
    (java.nio.file Files)
    (java.nio.file.attribute FileAttribute)
+   (java.util ArrayList)
+   (java.util.function Consumer)
    (java.util.zip GZIPInputStream)
    (org.apache.commons.compress.archivers.tar TarArchiveInputStream)))
 
@@ -153,13 +157,13 @@
                  [(assoc-in deps [:layers 0 :lib-dir] absent) :source-not-found [:layers 0 :lib-dir] [:lib-dir]]
                  [(assoc-in app [:layers 0 :jar-path] absent) :source-not-found [:layers 0 :jar-path] [:jar-path]]
                  [(assoc-in files [:layers 0 :local-dir] absent) :source-not-found [:layers 0 :local-dir] [:local-dir]]
-                 [(assoc app :to-tar nil) :invalid-to-tar [:to-tar] [:to-tar]]
-                 [(assoc app :env {"KEY" 1}) :invalid-env [:env] [:env]]
-                 [(assoc app :labels {:key "value"}) :invalid-labels [:labels] [:labels]]
+                 [(assoc app :to-tar nil) :invalid-value [:to-tar] [:to-tar]]
+                 [(assoc app :env {"KEY" 1}) :invalid-value [:env] [:env]]
+                 [(assoc app :labels {:key "value"}) :invalid-value [:labels] [:labels]]
                  [(assoc app :layers []) :invalid-layers [:layers] [:layers]]
                  [(assoc app :base {:image "scratch"}) :missing-required-key [:base :reason] [:reason]]
                  [(assoc app :base {:image "scratch" :reason " \t "}) :invalid-base [:base :reason] [:reason]]
-                 [(assoc modern :to {:registry ""}) :invalid-destination [:to :registry] [:registry]]
+                 [(assoc modern :to {:registry ""}) :invalid-value [:to :registry] [:registry]]
                  [(assoc modern :to {:tar "out.tar"}) :missing-required-key [:to :image-name] [:image-name]]
                  [(assoc modern :to {:image-name "example.invalid/img"}) :missing-required-key [:to :tar] [:tar]]
                  [(-> app (dissoc :target-image) (assoc :to-tar "out.tar")) :missing-required-key [:target-image] [:target-image]]]]
@@ -174,8 +178,7 @@
   (with-specs
     (fn [{:keys [app]} _]
       (let [modern (modern-destination app)
-            base-label "org.opencontainers.image.base.name"
-            version-label "io.github.realgenekim.thin-jar.version"]
+            base-label "org.opencontainers.image.base.name"]
         (doseq [[spec path keys]
                 [[(assoc modern :target-image (:target-image app)) [] #{:to :target-image}]
                  [(assoc modern :to-tar "out.tar") [] #{:to :to-tar}]
@@ -183,9 +186,7 @@
                  [(update modern :to assoc :tar "out.tar" :image-name "example.invalid/name") [:to] #{:registry :tar :image-name}]
                  [(update modern :to assoc :image-name "example.invalid/name") [:to] #{:registry :image-name}]
                  [(assoc app :base-image "scratch" :base {:image "scratch" :reason "Fixture"}) [] #{:base :base-image}]
-                 [(assoc app :labels {base-label "bad"}) [:labels] #{base-label}]
-                 [(assoc app :labels {version-label "bad"}) [:labels] #{version-label}]
-                 [(assoc app :labels {base-label "bad" version-label "bad"}) [:labels] #{base-label version-label}]]]
+                 [(assoc app :labels {base-label "bad"}) [:labels] #{base-label}]]]
           (let [data (ex-data (config-error jib/plan spec))]
             (is (= :conflicting-keys (:reason data)))
             (is (= path (:path data)))
@@ -213,8 +214,7 @@
                       :base {:image "gcr.io/distroless/java21" :legacy true}
                       :entrypoint ["java" "-jar" "/app.jar"]
                       :env {}
-                      :labels {"org.opencontainers.image.base.name" "gcr.io/distroless/java21"
-                               "io.github.realgenekim.thin-jar.version" "0.2.0"}
+                      :labels {"org.opencontainers.image.base.name" "gcr.io/distroless/java21"}
                       :layers [{:type :app :name "application"
                                 :entries [{:source (str (io/file dir "app.jar")) :container-path "/app.jar"}]}]
                       :verbose true}]
@@ -235,27 +235,155 @@
           (is (= {:image "example.invalid/base" :reason "Custom runtime"} (:base declared)))
           (is (= (update legacy :base dissoc :legacy) (update declared :base dissoc :reason))))))))
 
+(deftest source-kinds-are-validated
+  (with-specs
+    (fn [{:keys [app deps files]} dir]
+      (let [file (str (io/file dir "app.jar"))]
+        (doseq [[spec key source expected] [[deps :lib-dir file :directory]
+                                            [files :local-dir file :directory]
+                                            [app :jar-path (str dir) :regular-file]]]
+          (let [data (ex-data (config-error jib/plan (assoc-in spec [:layers 0 key] source)))]
+            (is (= :thin-jar.jib/invalid-config (:type data)))
+            (is (= :wrong-source-kind (:reason data)))
+            (is (= [:layers 0 key] (:path data)))
+            (is (= expected (:expected-kind data)))))))))
+
+(deftest file-filters-are-validated
+  (with-specs
+    (fn [{:keys [files]} dir]
+      (.mkdir (io/file dir "folder.py"))
+      (doseq [[key values] {:names [["main.py"] '("main.py") "main.py" #{:main.py} #{" "}]
+                            :extensions [nil #{} #{:py} [".py"] ".py"]
+                            :blacklist-prefixes ["main" [:main]]}
+              value values]
+        (testing (pr-str [key value])
+          (let [path [:layers 0 key]
+                data (ex-data (config-error jib/plan (assoc-in files path value)))]
+            (is (= [:invalid-value path] ((juxt :reason :path) data))))))
+      (let [path [:layers 0 :names]
+            data (ex-data (config-error jib/plan
+                                        (assoc-in files path #{"main.py" "mian.py" "folder.py"})))]
+        (is (= [:source-not-found path ["folder.py" "mian.py"]]
+               ((juxt :reason :path :missing-names) data))))
+      (is (= (jib/plan files) (jib/plan (assoc-in files [:layers 0 :names] nil))))
+      (is (= #{"/scripts/main.py"}
+             (container-paths (-> files
+                                  (assoc-in [:layers 0 :names] #{"main.py"})
+                                  (assoc-in [:layers 0 :extensions] #{"py"}))))))))
+
+(deftest spec-values-are-validated
+  (with-specs
+    (fn [{:keys [app deps files]} dir]
+      (let [modern (modern-destination app)]
+        (.mkdir (io/file dir "empty"))
+        (doseq [[spec path values]
+                [[app [:entrypoint] ["java" [] [:java 1] nil]]
+                 [app [:target-image] [nil :oops " " "NOT A REF"]]
+                 [modern [:to :registry] ["https://example.invalid/image" "NOT A REF"]]
+                 [(assoc modern :to {:tar "out.tar" :image-name "image:local"})
+                  [:to :image-name] ["NOT A REF"]]
+                 [(assoc modern :to {:tar "out.tar" :image-name "image:local"})
+                  [:to :tar] [nil " " 1]]
+                 [(assoc app :base {:image "scratch" :reason "Fixture"})
+                  [:base :image] [nil "NOT A REF"]]
+                 [app [:base-image] [nil "NOT A REF"]]
+                 [app [:verbose] ["false" nil 1]]
+                 [app [:to-tar] [nil " " 1]]
+                 [app [:env] [{"KEY" 1} [:key "value"]]]
+                 [app [:labels] [nil {:key "value"}]]
+                 [app [:layers 0 :container-path] ["rel/app.jar" "" 5]]
+                 [(assoc-in deps [:layers 0 :lib-dir] (str (io/file dir "empty")))
+                  [:layers 0 :container-path] [nil "relative"]]
+                 [files [:layers 0 :container-path] ["" "relative"]]]
+                value values]
+          (testing (pr-str [path value])
+            (let [updated (assoc-in spec path value)]
+              (doseq [validate [jib/plan jib/validate-spec!]]
+                (let [data (ex-data (config-error validate updated))]
+                  (is (= [:thin-jar.jib/invalid-config :invalid-value path]
+                         ((juxt :type :reason :path) data))))))))
+        (is (= (jib/plan app) (jib/plan (assoc app :env nil))))
+        (is (= (jib/plan app) (jib/plan (update app :entrypoint #(ArrayList. %)))))
+        (is (= {:image "scratch" :legacy true}
+               (:base (jib/plan (assoc app :base-image "scratch")))))
+        (doseq [spec [deps files]]
+          (let [data (ex-data (config-error jib/plan (update-in spec [:layers 0] dissoc :container-path)))]
+            (is (= [:missing-required-key [:layers 0 :container-path]]
+                   ((juxt :reason :path) data)))))))))
+
+(deftest layer-collections-are-compatible
+  (with-specs
+    (fn [{:keys [app deps files]} _]
+      (let [layers (mapv (comp first :layers) [files deps app])
+            expected (:layers (jib/plan (assoc app :layers layers)))]
+        (is (= (jib/plan app) (jib/plan (update app :layers set))))
+        (doseq [ordered [(apply list layers) (ArrayList. layers)]]
+          (is (= expected (:layers (jib/plan (assoc app :layers ordered))))))
+        (is (= :invalid-layers
+               (:reason (ex-data (config-error jib/plan (assoc app :layers (first layers)))))))))))
+
 (deftest upstream-comment-examples-plan
   (with-specs
     (fn [_ dir]
-      (let [examples (with-open [reader (PushbackReader. (io/reader "src/thin_jar/jib.clj"))]
-                       (->> (repeatedly #(read {:eof ::eof} reader))
-                            (take-while #(not= ::eof %))
-                            (filter #(and (seq? %) (= 'comment (first %))))
-                            first
-                            rest
-                            (filter #(and (seq? %) (= 'deploy! (first %))))
-                            (mapv second)))
-            source-paths #{"target/lib" "target/server2.jar" "target/reddit-scraper.jar" "classify"}
-            file io/file]
+      (let [examples (edn/read-string (slurp (io/resource "thin_jar/f5bd8dd_examples.edn")))
+            source-keys [:lib-dir :jar-path :local-dir]
+            path #(str (io/file dir %))
+            entry (fn [source destination] {:source (path source) :container-path destination})
+            rewrite-sources (fn [spec]
+                              (update spec :layers
+                                      (fn [layers]
+                                        (mapv (fn [layer]
+                                                (reduce (fn [result key]
+                                                          (if (contains? result key)
+                                                            (update result key path)
+                                                            result))
+                                                        layer source-keys))
+                                              layers))))
+            defaults {:env {} :verbose true}
+            expected
+            [(assoc defaults
+                    :destination {:registry "us-west1-docker.pkg.dev/proj/repo/server2:latest"}
+                    :base {:image "gcr.io/distroless/java21" :legacy true}
+                    :labels {"org.opencontainers.image.base.name" "gcr.io/distroless/java21"}
+                    :entrypoint ["java" "-cp" "/app/server2.jar:/app/lib/*" "server2.server"]
+                    :layers [{:type :deps :name "dependencies"
+                              :entries [(entry "target/lib/dep.jar" "/app/lib/dep.jar")]}
+                             {:type :app :name "application"
+                              :entries [(entry "target/server2.jar" "/app/server2.jar")]}])
+             (assoc defaults
+                    :destination {:registry "us.gcr.io/proj/reddit-classifier:latest"}
+                    :base {:image "us.gcr.io/proj/reddit-classifier-base:latest" :legacy true}
+                    :labels {"org.opencontainers.image.base.name" "us.gcr.io/proj/reddit-classifier-base:latest"}
+                    :entrypoint ["java" "-cp" "/lib/*:/reddit-scraper.jar" "clojure.main" "-m" "genek.cli.main"]
+                    :layers [{:type :deps :name "dependencies"
+                              :entries [(entry "target/lib/dep.jar" "/lib/dep.jar")]}
+                             {:type :app :name "application"
+                              :entries [(entry "target/reddit-scraper.jar" "/reddit-scraper.jar")]}
+                             {:type :files :name (str "files:" (path "classify"))
+                              :entries [(entry "classify/main.py" "/classify/main.py")]}])]]
         (doseq [p ["target/lib" "classify"]]
-          (.mkdirs (file dir p)))
-        (doseq [p ["target/server2.jar" "target/reddit-scraper.jar"]]
-          (spit (file dir p) "fixture"))
-        (is (= 2 (count examples)))
-        (with-redefs [io/file (fn [p] (if (source-paths p) (file dir p) (file p)))]
-          (doseq [spec examples]
-            (is (= {:registry (:target-image spec)} (:destination (jib/plan spec))))))))))
+          (.mkdirs (io/file dir p)))
+        (doseq [p ["target/lib/dep.jar" "target/server2.jar" "target/reddit-scraper.jar"
+                   "classify/main.py" "classify/test_skip.py" "classify/other.rb"]]
+          (spit (io/file dir p) "fixture"))
+        (is (= expected (mapv (comp jib/plan rewrite-sources) examples)))))))
+
+(deftest only-the-base-label-is-automatic
+  (with-specs
+    (fn [{:keys [app]} _]
+      (let [labels (:labels (jib/plan (assoc app :labels {"io.github.realgenekim.thin-jar.version" "mine"})))]
+        (is (= #{"org.opencontainers.image.base.name" "io.github.realgenekim.thin-jar.version"} (set (keys labels))))
+        (is (= "mine" (get labels "io.github.realgenekim.thin-jar.version")))))))
+
+(deftest library-labels-are-isolated
+  (let [library-labels (ns-resolve 'thin-jar.jib 'library-labels)]
+    (is (some-> library-labels meta :private))
+    (when library-labels
+      (with-specs
+        (fn [{:keys [app]} _]
+          (with-redefs-fn {library-labels (constantly {})}
+            #(is (= {"example.label" "value"}
+                    (:labels (jib/plan (assoc app :labels {"example.label" "value"})))))))))))
 
 (defn- archive-entries [input]
   (with-open [stream (TarArchiveInputStream. input)]
@@ -305,7 +433,6 @@
                     :image-id (:image-id receipt)
                     :base {:image "scratch"}
                     :labels {"org.opencontainers.image.base.name" "scratch"
-                             "io.github.realgenekim.thin-jar.version" "0.2.0"
                              "org.example.service" "worker"}
                     :library-version "0.2.0"}
                    receipt))
@@ -318,3 +445,49 @@
                     :digest (:image-digest receipt) :image-id (:image-id receipt)}
                    (select-keys legacy [:destination :target-image :tar-path :digest :image-id])))
             (is (= {:tar (str legacy-tar) :image-name target} (:resolved-destination legacy)))))))))
+
+(deftest deployment-stdout-matches-upstream-and-fork
+  (with-specs
+    (fn [{:keys [app]} dir]
+      (let [target (:target-image app)
+            tar-path (str (io/file dir "out.tar"))
+            spec (assoc app :base {:image "scratch" :reason "Offline fixture"})
+            layer (first (:layers spec))
+            make-containerizer @#'jib/make-containerizer
+            log-events (atom [])]
+        (with-redefs [jib/make-containerizer
+                      (fn [image tar logger]
+                        (doto ^Containerizer (make-containerizer image (or tar tar-path) logger)
+                          (.setOfflineMode true)
+                          (.setBaseImageLayersCache (.toPath (io/file dir "base-cache")))
+                          (.setApplicationLayersCache (.toPath (io/file dir "app-cache")))))
+                      jib/make-logger (fn [_]
+                                        (reify Consumer
+                                          (accept [_ event] (swap! log-events conj event))))]
+          (doseq [verbose [false true]
+                  tar? [false true]]
+            (let [options (cond-> (assoc spec :verbose verbose)
+                            tar? (assoc :to-tar tar-path :env {"APP_ENV" "test"}))
+                  expected (concat
+                             [(if tar?
+                                "Building container image tarball with Jib (no push)..."
+                                "Building and pushing container image with Jib...")
+                              "  Base image: scratch"
+                              (str "  Target image: " target)]
+                             (when tar? [(str "  Tarball: " tar-path) "  Env: {\"APP_ENV\" \"test\"}"])
+                             ["  Layers:"
+                              (str "    - :app: " (dissoc layer :type))
+                              :elapsed
+                              (if tar?
+                                (str "Built image tarball " tar-path " (not pushed)")
+                                "Container image built and pushed successfully!")
+                              (str "  Image: " target)])
+                  actual (str/split-lines (with-out-str (jib/deploy! options)))]
+              (is (= expected (map #(if (re-matches #"\"Elapsed time: [0-9.]+ msecs\"" %) :elapsed %) actual))))))
+        (is (empty? @log-events))))))
+
+(deftest release-notes-cover-compatibility
+  (let [changelog (slurp "CHANGELOG.md")]
+    (is (re-find #"(?s)### Behaviour changes.*`deploy!`.*receipt.*nil" changelog))
+    (is (re-find #"(?s)### Behaviour changes.*unknown keys.*wrong-kind.*invalid values.*:names.*:container-path.*image root" changelog))
+    (is (re-find #"(?s)### Known, unchanged.*credential.*target image's registry.*f5bd8dd.*fork" changelog))))

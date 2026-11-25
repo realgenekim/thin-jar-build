@@ -4,18 +4,17 @@
    [clojure.java.io :as io]
    [clojure.string :as str])
   (:import
-   (com.google.cloud.tools.jib.api Containerizer ImageReference Jib JibContainer JibContainerBuilder LogEvent RegistryImage TarImage)
+   (com.google.cloud.tools.jib.api Containerizer ImageReference InvalidImageReferenceException Jib JibContainer JibContainerBuilder RegistryImage TarImage)
    (com.google.cloud.tools.jib.api.buildplan AbsoluteUnixPath FileEntriesLayer)
    (com.google.cloud.tools.jib.frontend CredentialRetrieverFactory)
    (java.io File)
-   (java.util ArrayList List)
+   (java.util ArrayList Collection List)
    (java.util.function Consumer)))
 
 (def version "The thin-jar-build library version." "0.2.0")
 
 (def ^:private default-base "gcr.io/distroless/java21")
 (def ^:private base-label "org.opencontainers.image.base.name")
-(def ^:private version-label "io.github.realgenekim.thin-jar.version")
 
 (def ^:private spec-contract
   {:top {:allowed #{:base :base-image :target-image :entrypoint :layers :verbose :to :to-tar :env :labels}
@@ -36,22 +35,25 @@
                     :required #{:type :local-dir :container-path}
                     :source-key :local-dir}}})
 
-(defn- invalid-config! [reason path allowed & [offending]]
+(defn- invalid-config! [reason path allowed & [offending details]]
   (let [offending (vec (sort-by pr-str offending))
         environment? (and (= reason :unknown-key) (empty? path)
                           (some #{:environment} offending))]
     (throw (ex-info (str "Invalid Jib configuration " (pr-str reason) " at " (pr-str path)
+                         (when-let [missing-names (:missing-names details)]
+                           (str ". Missing files: " (pr-str missing-names)))
                          (when environment?
                            ". Use :env to add or override individual variables. The :environment key of another fork sets the whole environment map on the Jib builder and enforces JVM flags, so it is not accepted as an alias."))
-                    {:type ::invalid-config
-                     :reason reason
-                     :path path
-                     :offending-keys offending
-                     :unknown-keys (if (= reason :unknown-key) offending [])
-                     :allowed-keys (vec (sort allowed))}))))
+                    (merge {:type ::invalid-config
+                            :reason reason
+                            :path path
+                            :offending-keys offending
+                            :unknown-keys (if (= reason :unknown-key) offending [])
+                            :allowed-keys (vec (sort allowed))}
+                           details)))))
 
 (defn- validate-required! [spec path allowed required]
-  (when-let [missing (first (remove spec (sort required)))]
+  (when-let [missing (first (remove #(contains? spec %) (sort required)))]
     (invalid-config! :missing-required-key (conj path missing) allowed [missing])))
 
 (defn- validate-keys! [spec path {:keys [allowed required]}]
@@ -61,11 +63,49 @@
     (invalid-config! :unknown-key path allowed unknown))
   (validate-required! spec path allowed required))
 
-(defn- source-exists? [source]
+(defn- nonblank-string? [x]
+  (and (string? x) (not (str/blank? x))))
+
+(defn- string-map? [x]
+  (and (map? x)
+       (every? (fn [[k v]] (and (string? k) (string? v))) x)))
+
+(defn- invalid-value! [path allowed]
+  (invalid-config! :invalid-value path allowed [(peek path)]))
+
+(defn- source-file [source]
   (try
-    (some-> (io/file source) .exists)
+    (io/file source)
     (catch IllegalArgumentException _
-      false)))
+      nil)))
+
+(defn- validate-source! [layer path allowed source-key]
+  (let [source-path (conj path source-key)
+        ^File source (source-file (get layer source-key))
+        jar? (= source-key :jar-path)]
+    (when-not (and source (.exists source))
+      (invalid-config! :source-not-found source-path allowed [source-key]))
+    (when-not (if jar? (.isFile source) (.isDirectory source))
+      (invalid-config! :wrong-source-kind source-path allowed [source-key]
+                       {:expected-kind (if jar? :regular-file :directory)}))
+    source))
+
+(defn- validate-file-filters! [{:keys [names extensions blacklist-prefixes] :as layer}
+                               ^File source path allowed]
+  (when (and (some? names) (not (and (set? names) (every? nonblank-string? names))))
+    (invalid-value! (conj path :names) allowed))
+  (when (and (contains? layer :extensions)
+             (not (and (set? extensions) (seq extensions) (every? string? extensions))))
+    (invalid-value! (conj path :extensions) allowed))
+  (when-not (and (seqable? blacklist-prefixes) (every? string? blacklist-prefixes))
+    (invalid-value! (conj path :blacklist-prefixes) allowed))
+  (when (seq names)
+    (let [files (into #{} (comp (filter #(.isFile ^File %)) (map #(.getName ^File %)))
+                      (.listFiles source))
+          missing (seq (sort (remove files names)))]
+      (when missing
+        (invalid-config! :source-not-found (conj path :names) allowed [:names]
+                         {:missing-names (vec missing)})))))
 
 (defn- validate-layer! [index layer]
   (let [path [:layers index]
@@ -78,15 +118,23 @@
         (nil? type) (invalid-config! :missing-required-key type-path #{:type} [:type])
         (nil? contract) (invalid-config! :unknown-layer-type type-path #{:type} [:type]))
       (validate-keys! layer path contract)
-      (when-not (source-exists? (get layer source-key))
-        (invalid-config! :source-not-found (conj path source-key) allowed [source-key])))))
+      (let [container-path (:container-path layer)]
+        (when-not (and (nonblank-string? container-path) (str/starts-with? container-path "/"))
+          (invalid-value! (conj path :container-path) allowed)))
+      (let [source (validate-source! layer path allowed source-key)]
+        (when (= :files type)
+          (validate-file-filters! layer source path allowed))))))
 
-(defn- nonblank-string? [x]
-  (and (string? x) (not (str/blank? x))))
+(defn- to-imgref [image-config]
+  (ImageReference/parse image-config))
 
-(defn- string-map? [x]
-  (and (map? x)
-       (every? (fn [[k v]] (and (string? k) (string? v))) x)))
+(defn- validate-image! [value path allowed]
+  (when-not (nonblank-string? value)
+    (invalid-value! path allowed))
+  (try
+    (to-imgref value)
+    (catch InvalidImageReferenceException _
+      (invalid-value! path allowed))))
 
 (defn- validate-destination! [spec top-allowed]
   (if (contains? spec :to)
@@ -104,26 +152,32 @@
           (invalid-config! :conflicting-keys [:to] allowed (keys to)))
         (validate-required! to [:to] allowed required))
       (doseq [[k v] to]
-        (when-not (nonblank-string? v)
-          (invalid-config! :invalid-destination [:to k] allowed [k]))))
+        (if (= :tar k)
+          (when-not (nonblank-string? v)
+            (invalid-value! [:to k] allowed))
+          (validate-image! v [:to k] allowed))))
     (do
-      (when-not (:target-image spec)
+      (when-not (contains? spec :target-image)
         (if (contains? spec :to-tar)
           (validate-required! spec [] top-allowed #{:target-image})
           (invalid-config! :no-destination [] top-allowed [:to :target-image])))
+      (validate-image! (:target-image spec) [:target-image] top-allowed)
       (when (and (contains? spec :to-tar) (not (nonblank-string? (:to-tar spec))))
-        (invalid-config! :invalid-to-tar [:to-tar] top-allowed [:to-tar])))))
+        (invalid-value! [:to-tar] top-allowed)))))
 
 (defn- validate-base! [spec allowed]
-  (when (contains? spec :base)
+  (if (contains? spec :base)
+    (do
+      (when (contains? spec :base-image)
+        (invalid-config! :conflicting-keys [] allowed [:base :base-image]))
+      (let [base (:base spec)
+            contract (:base spec-contract)]
+        (validate-keys! base [:base] contract)
+        (validate-image! (:image base) [:base :image] (:allowed contract))
+        (when-not (nonblank-string? (:reason base))
+          (invalid-config! :invalid-base [:base :reason] (:allowed contract) [:reason]))))
     (when (contains? spec :base-image)
-      (invalid-config! :conflicting-keys [] allowed [:base :base-image]))
-    (let [base (:base spec)
-          contract (:base spec-contract)]
-      (validate-keys! base [:base] contract)
-      (doseq [k [:image :reason]]
-        (when-not (nonblank-string? (get base k))
-          (invalid-config! :invalid-base [:base k] (:allowed contract) [k]))))))
+      (validate-image! (:base-image spec) [:base-image] allowed))))
 
 (defn validate-spec!
   "Return spec if its configuration and layer sources are valid. Throw ex-info otherwise."
@@ -132,21 +186,24 @@
     (validate-keys! spec [] contract)
     (validate-destination! spec allowed)
     (validate-base! spec allowed)
-    (let [{:keys [layers env labels]} spec]
-      (when-not (and (sequential? layers) (seq layers))
+    (let [{:keys [entrypoint layers env labels verbose]} spec]
+      (when-not (and (or (sequential? entrypoint) (instance? List entrypoint))
+                     (seq entrypoint) (every? string? entrypoint))
+        (invalid-value! [:entrypoint] allowed))
+      (when-not (and (or (coll? layers) (instance? Collection layers))
+                     (not (map? layers)) (seq layers))
         (invalid-config! :invalid-layers [:layers] allowed [:layers]))
+      (when (and (contains? spec :verbose) (not (boolean? verbose)))
+        (invalid-value! [:verbose] allowed))
       (when (and (some? env) (not (string-map? env)))
-        (invalid-config! :invalid-env [:env] allowed [:env]))
+        (invalid-value! [:env] allowed))
       (when (and (contains? spec :labels) (not (string-map? labels)))
-        (invalid-config! :invalid-labels [:labels] allowed [:labels]))
-      (when-let [reserved (seq (filter #(contains? labels %) [base-label version-label]))]
+        (invalid-value! [:labels] allowed))
+      (when-let [reserved (seq (filter #(contains? labels %) [base-label]))]
         (invalid-config! :conflicting-keys [:labels] allowed reserved))
       (doseq [[index layer] (map-indexed vector layers)]
         (validate-layer! index layer))))
   spec)
-
-(defn- to-imgref [image-config]
-  (ImageReference/parse image-config))
 
 (defn make-logger
   "Create a Jib logger Consumer."
@@ -182,6 +239,9 @@
      :name name
      :entries (vec entries)}))
 
+(defn- library-labels [base]
+  {base-label (:image base)})
+
 (defn plan
   "Validate a spec and resolve its destination, base and layer entries using local files."
   [spec]
@@ -195,7 +255,7 @@
      :base base
      :entrypoint (vec entrypoint)
      :env (or env {})
-     :labels (assoc labels base-label (:image base) version-label version)
+     :labels (merge labels (library-labels base))
      :layers (mapv plan-layer layers)
      :verbose verbose}))
 
@@ -228,33 +288,48 @@
 (defn- containerize! [^JibContainerBuilder builder ^Containerizer containerizer]
   (.containerize builder containerizer))
 
-(defn- execute-plan! [{:keys [destination base entrypoint env labels layers verbose]}]
+(defn- execute-plan! [{:keys [destination base entrypoint env labels layers verbose]} layer-specs]
   (let [{:keys [registry tar image-name]} destination
         target-image (or registry image-name)
-        logger (make-logger verbose)
-        builder (base-builder base target-image logger)
-        containerizer (make-containerizer target-image tar logger)]
-    (.addEventHandler containerizer LogEvent logger)
-    (doseq [layer layers]
-      (.addFileEntriesLayer builder (build-layer layer)))
-    (doseq [[k v] (sort env)]
-      (.addEnvironmentVariable builder k v))
-    (.setLabels builder labels)
-    (.setEntrypoint builder (ArrayList. ^List entrypoint))
-    (let [^JibContainer result (containerize! builder containerizer)]
-      {:destination destination
-       :pushed? (.isImagePushed result)
-       :image-digest (str (.getDigest result))
-       :image-id (str (.getImageId result))
-       :base (select-keys base [:image])
-       :labels labels
-       :library-version version})))
+        logger (make-logger verbose)]
+    (println (if tar
+               "Building container image tarball with Jib (no push)..."
+               "Building and pushing container image with Jib..."))
+    (println (str "  Base image: " (:image base)))
+    (println (str "  Target image: " target-image))
+    (when tar (println (str "  Tarball: " tar)))
+    (when (seq env) (println (str "  Env: " env)))
+    (println "  Layers:")
+    (doseq [{:keys [type] :as layer} layer-specs]
+      (println (str "    - " type ": " (dissoc layer :type))))
+    (let [builder (base-builder base target-image logger)
+          containerizer (make-containerizer target-image tar logger)]
+      (doseq [layer layers]
+        (.addFileEntriesLayer builder (build-layer layer)))
+      (doseq [[k v] (sort env)]
+        (.addEnvironmentVariable builder k v))
+      (.setLabels builder labels)
+      (let [^JibContainer result (time
+                                   (-> builder
+                                       (.setEntrypoint (ArrayList. ^List entrypoint))
+                                       (containerize! containerizer)))]
+        (if tar
+          (println (str "Built image tarball " tar " (not pushed)"))
+          (println "Container image built and pushed successfully!"))
+        (println (str "  Image: " target-image))
+        {:destination destination
+         :pushed? (.isImagePushed result)
+         :image-digest (str (.getDigest result))
+         :image-id (str (.getImageId result))
+         :base (select-keys base [:image])
+         :labels labels
+         :library-version version}))))
 
 (defn deploy!
   "Build the validated image and return a receipt. Legacy destination keys retain
    the fork's receipt fields and expose the normalized map as :resolved-destination."
   [spec]
-  (let [{:keys [destination image-digest] :as receipt} (execute-plan! (plan spec))]
+  (let [{:keys [destination image-digest] :as receipt} (execute-plan! (plan spec) (:layers spec))]
     (if (contains? spec :to)
       receipt
       (let [{:keys [registry tar image-name]} destination]

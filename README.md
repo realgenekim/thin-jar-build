@@ -97,8 +97,9 @@ configured, the floating default is `gcr.io/distroless/java21`.
 
 `:env` adds or overrides individual variables using a map of strings to strings.
 `:labels` accepts a map of strings to strings. The library reserves and sets
-`org.opencontainers.image.base.name` and `io.github.realgenekim.thin-jar.version`
-to the base reference and library version, respectively.
+`org.opencontainers.image.base.name` to the base reference. It sets no version
+label, so an image digest changes only when the image changes; the library version
+is in the receipt as `:library-version`.
 
 ### Plan and receipt
 
@@ -116,8 +117,7 @@ absolute local `:source` paths and resolved `:container-path` values.
  :image-digest "sha256:..."
  :image-id "sha256:..."
  :base {:image "gcr.io/distroless/java21"}
- :labels {"org.opencontainers.image.base.name" "gcr.io/distroless/java21"
-          "io.github.realgenekim.thin-jar.version" "0.2.0"}
+ :labels {"org.opencontainers.image.base.name" "gcr.io/distroless/java21"}
  :library-version "0.2.0"}
 ```
 

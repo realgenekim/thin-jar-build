@@ -1,0 +1,24 @@
+;; Source: f5bd8dd, src/thin_jar/jib.clj
+[{:target-image "us-west1-docker.pkg.dev/proj/repo/server2:latest"
+            :entrypoint ["java" "-cp" "/app/server2.jar:/app/lib/*" "server2.server"]
+            :layers [{:type :deps
+                      :lib-dir "target/lib"
+                      :container-path "/app/lib"}
+                     {:type :app
+                      :jar-path "target/server2.jar"
+                      :container-path "/app/server2.jar"}]}
+
+ {:base-image "us.gcr.io/proj/reddit-classifier-base:latest"
+            :target-image "us.gcr.io/proj/reddit-classifier:latest"
+            :entrypoint ["java" "-cp" "/lib/*:/reddit-scraper.jar" "clojure.main" "-m" "genek.cli.main"]
+            :layers [{:type :deps
+                      :lib-dir "target/lib"
+                      :container-path "/lib"}
+                     {:type :app
+                      :jar-path "target/reddit-scraper.jar"
+                      :container-path "/reddit-scraper.jar"}
+                     {:type :files
+                      :local-dir "classify"
+                      :container-path "/classify"
+                      :extensions #{".py" ".txt"}
+                      :blacklist-prefixes ["test_" "experiment_"]}]}]

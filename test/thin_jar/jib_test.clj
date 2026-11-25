@@ -622,6 +622,12 @@
             reason (fn [spec] ((juxt :reason :path) (ex-data (config-error jib/plan spec))))]
         (is (= [:missing-required-key [:layers 0 :type]]
                (reason (assoc deps :layers [(dissoc layer :type)]))))
+        (doseq [source [(.toURI (io/file dir)) (.toURL (.toURI (io/file dir)))]]
+          (is (= (container-paths deps)
+                 (container-paths (assoc-in deps [:layers 0 :lib-dir] source)))))
+        (is (= [:missing] (mapv :cause (:empty-layers (jib/plan (assoc-in deps [:layers 0 :lib-dir] " "))))))
+        (let [data (ex-data (config-error jib/plan (assoc-in files [:layers 0 "bad"] 1)))]
+          (is (= [:unknown-key [:layers 0] ["bad"]] ((juxt :reason :path :offending-keys) data))))
         (doseq [bad [42 nil :dir]]
           (is (= [:invalid-value [:layers 0 :lib-dir]]
                  (reason (assoc-in deps [:layers 0 :lib-dir] bad)))))

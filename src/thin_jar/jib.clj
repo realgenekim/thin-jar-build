@@ -113,13 +113,6 @@
   (when-not (and (seqable? blacklist-prefixes) (every? string? blacklist-prefixes))
     (invalid-value! (conj path :blacklist-prefixes) allowed)))
 
-(defn- str-or-file
-  "A directory source as text: a string, or a File's path. Anything else is nil (never a valid source)."
-  [value]
-  (cond (string? value) value
-        (instance? File value) (.getPath ^File value)
-        :else nil))
-
 (defn- container-path-value
   "f5bd8dd and the fork used any container path through its text form (File, Path, ...)."
   [value]
@@ -133,8 +126,8 @@
         type-path (conj path :type)]
     (when-not (map? layer)
       (invalid-config! :expected-map path #{:type}))
-    (when-not (every? keyword? (keys layer))
-      (validate-keys! layer path {:allowed #{:type} :required #{:type}}))
+    (when-let [foreign (seq (remove keyword? (keys layer)))]
+      (invalid-config! :unknown-key path #{:type} foreign))
     (let [{:keys [type]} layer
           {:keys [allowed] :as contract} (get-in spec-contract [:layers type])]
       (cond
@@ -149,7 +142,7 @@
         (validate-jar-source! (:jar-path layer) path allowed))
       (doseq [source-key [:lib-dir :local-dir]
               :when (and (contains? (get-in spec-contract [:layers type :allowed]) source-key)
-                         (not (nonblank-string? (str-or-file (get layer source-key)))))]
+                         (nil? (source-file (get layer source-key))))]
         (invalid-value! (conj path source-key) allowed))
       (when (= :files type)
         (validate-file-filters! layer path allowed)))))

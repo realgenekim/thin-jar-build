@@ -20,18 +20,20 @@
 ### Behaviour changes
 
 - `deploy!` returns a receipt. At `f5bd8dd` it returned nil.
-- Validation refuses, with a typed `ex-info` `:reason` before any build or push,
-  values that never produced a correct image: unknown keys or an unknown layer
-  type; a missing required key; a non-map spec or layer; a conflicting or
-  missing destination; an app JAR whose path is missing or does not point to a
+- Validation refuses, with a typed `ex-info` `:reason` before any build or push:
+  unknown keys or an unknown layer type; a missing required key; a non-map spec,
+  layer, `:to` or `:base`; `:layers` that is a map or an empty collection; a
+  conflicting or missing destination; an app JAR whose path is missing or does not point to a
   regular file; a string, empty, or non-string entrypoint; an image reference
-  Jib cannot parse; an empty collection of layers; a relative container path;
-  a directory source that is not a string or `File`; and malformed values:
-  `:names` that is not a collection, array or map, `:extensions` or
+  Jib cannot parse; a relative container path; a directory source that
+  `clojure.java.io/file` cannot convert (a string, `File`, `URI` or file `URL`
+  are accepted); and malformed values: `:names` that is not nil, a map, a set,
+  a transient map or set, a collection or an array, `:extensions` or
   `:blacklist-prefixes` that is not a collection or array of strings,
   non-string `:env` or `:labels`, the reserved base label, a blank `:base`
-  `:reason`. A malformed filter was refused even where `f5bd8dd` built an
-  image only because the directory was empty or absent, so no file reached it.
+  `:reason`. A malformed filter value or a relative container path is refused
+  even where `f5bd8dd` built an image only because the directory was empty or
+  absent, so no file reached it.
 - Vector, list and Java-array `:names` allowlists now match filenames by value
   (the fork's `contains?` did not match their elements). This is additive.
   Maps match by key and sets keep their existing membership rules.

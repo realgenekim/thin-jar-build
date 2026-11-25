@@ -126,8 +126,13 @@
         type-path (conj path :type)]
     (when-not (map? layer)
       (invalid-config! :expected-map path #{:type}))
-    (when-let [foreign (seq (remove keyword? (keys layer)))]
-      (invalid-config! :unknown-key path #{:type} foreign))
+    ;; Read :type without keyword lookup: a sorted map with string keys would throw on (:type layer).
+    (let [type (some (fn [[k v]] (when (= :type k) v)) layer)
+          contract (get-in spec-contract [:layers type])]
+      (if contract
+        (validate-keys! layer path contract)
+        (when-let [foreign (seq (remove keyword? (keys layer)))]
+          (invalid-config! :unknown-key path #{:type} foreign))))
     (let [{:keys [type]} layer
           {:keys [allowed] :as contract} (get-in spec-contract [:layers type])]
       (cond

@@ -628,6 +628,9 @@
         (is (= [:missing] (mapv :cause (:empty-layers (jib/plan (assoc-in deps [:layers 0 :lib-dir] " "))))))
         (let [data (ex-data (config-error jib/plan (assoc-in files [:layers 0 "bad"] 1)))]
           (is (= [:unknown-key [:layers 0] ["bad"]] ((juxt :reason :path :offending-keys) data))))
+        (let [data (ex-data (config-error jib/plan (update-in files [:layers 0] assoc "bad" 1 :bogus 2)))]
+          (is (= [:unknown-key #{"bad" :bogus}] [(:reason data) (set (:offending-keys data))]))
+          (is (contains? (set (:allowed-keys data)) :local-dir)))
         (doseq [bad [42 nil :dir]]
           (is (= [:invalid-value [:layers 0 :lib-dir]]
                  (reason (assoc-in deps [:layers 0 :lib-dir] bad)))))

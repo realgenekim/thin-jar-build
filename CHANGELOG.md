@@ -28,8 +28,9 @@
   Jib cannot parse; a relative container path; a directory source that
   `clojure.java.io/file` cannot convert (a string, `File`, `URI` or file `URL`
   are accepted); and malformed values: `:names` that is not nil, a map, a set,
-  a transient map or set, a collection or an array, `:extensions` or
-  `:blacklist-prefixes` that is not a collection or array of strings,
+  a transient map or set, a collection or an array, non-nil `:extensions` or
+  `:blacklist-prefixes` that is not a collection or array of strings, a blank
+  tar path (`:to-tar ""`, a blank `:to :tar`),
   non-string `:env` or `:labels`, the reserved base label, a blank `:base`
   `:reason`. A malformed filter value or a relative container path is refused
   even where `f5bd8dd` built an image only because the directory was empty or

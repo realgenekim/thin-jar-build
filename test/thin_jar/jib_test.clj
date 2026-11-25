@@ -8,10 +8,10 @@
   (:import
    (com.fasterxml.jackson.databind ObjectMapper)
    (com.google.cloud.tools.jib.api Containerizer)
-   (java.io ByteArrayInputStream)
+   (java.io ByteArrayInputStream StringWriter)
    (java.nio.file Files)
    (java.nio.file.attribute FileAttribute)
-   (java.util ArrayList)
+   (java.util ArrayList TreeSet)
    (java.util.function Consumer)
    (java.util.zip GZIPInputStream)
    (org.apache.commons.compress.archivers.tar TarArchiveInputStream)))
@@ -217,6 +217,7 @@
                       :labels {"org.opencontainers.image.base.name" "gcr.io/distroless/java21"}
                       :layers [{:type :app :name "application"
                                 :entries [{:source (str (io/file dir "app.jar")) :container-path "/app.jar"}]}]
+                      :empty-layers []
                       :verbose true}]
         (is (= "0.2.0" jib/version))
         (is (= expected (jib/plan app)))
@@ -251,11 +252,13 @@
 (deftest old-forms-still-plan
   (with-specs
     (fn [{:keys [app deps files]} _]
-      (doseq [extensions [[".py"] '(".py") #{".py"}]]
+      (doseq [extensions [[".py"] '(".py") #{".py"} (sorted-set ".py") (into-array String [".py"])]]
         (is (= #{"/scripts/main.py" "/scripts/test_skip.py"}
                (container-paths (assoc-in files [:layers 0 :extensions] extensions)))))
       (doseq [names [["main.py" "optional.py"] '("main.py" "optional.py")
-                     #{"main.py" "optional.py"}]]
+                     #{"main.py" "optional.py"} (into-array String ["main.py" "optional.py"])
+                     (sorted-set-by String/CASE_INSENSITIVE_ORDER "MAIN.PY")
+                     (doto (TreeSet. String/CASE_INSENSITIVE_ORDER) (.add "MAIN.PY"))]]
         (is (= #{"/scripts/main.py"}
                (container-paths (assoc-in files [:layers 0 :names] names)))))
       (is (= (jib/plan files) (jib/plan (assoc-in files [:layers 0 :names] nil))))
@@ -267,39 +270,71 @@
                          #{"/app.jar" "/other.jar" "/main.py" "/test_skip.py" "/notes.txt" "/other.rb"}
                          #{"/main.py" "/test_skip.py" "/notes.txt"})]
           (is (= expected (container-paths (update-in spec [:layers 0] update-path))))))
-      (doseq [[entrypoint expected] [[[] []] [#{"java"} ["java"]]
+      (is (= :invalid-value (:reason (ex-data (config-error jib/plan (assoc app :entrypoint []))))))
+      (doseq [[entrypoint expected] [[#{"java"} ["java"]]
                                      [(into-array String ["java"]) ["java"]]]]
         (let [spec (assoc app :entrypoint entrypoint :verbose nil)
               planned (jib/plan spec)]
           (is (= expected (:entrypoint planned)))
           (is (nil? (:verbose planned)))
           (is (= #{"/app.jar"} (container-paths spec)))))
+      (doseq [verbose [false "false" 1 :debug]]
+        (is (= verbose (:verbose (jib/plan (assoc app :verbose verbose))))))
+      (is (= [] (:empty-layers (jib/plan app))))
       (is (= (jib/plan app) (jib/plan (update app :layers object-array)))))))
 
-(deftest empty-layers-are-refused
+(deftest empty-layers-are-reported
   (with-specs
     (fn [{:keys [app deps files]} dir]
       (let [empty-dir (str (io/file dir "empty"))
+            blacklist-dir (str (io/file dir "blacklisted"))
             deps-layer (assoc (first (:layers deps)) :lib-dir empty-dir)
             files-layer (first (:layers files))
-            default-extensions #{".py" ".txt" ".sh" ".json" ".yaml" ".yml"}]
+            default-extensions #{".py" ".txt" ".sh" ".json" ".yaml" ".yml"}
+            app (assoc app :base {:image "scratch" :reason "Offline fixture"}
+                       :to-tar (str (io/file dir "out.tar")) :verbose false)
+            containerize! @#'jib/containerize!]
         (.mkdir (io/file empty-dir))
+        (.mkdir (io/file blacklist-dir))
+        (spit (io/file blacklist-dir "test_a.py") "")
         (doseq [[layer source extensions names blacklist]
                 [[deps-layer empty-dir nil nil nil]
                  [(assoc files-layer :local-dir empty-dir) empty-dir default-extensions nil []]
                  [(assoc files-layer :extensions []) (str dir) #{} nil []]
+                 [(assoc files-layer :extensions #{}) (str dir) #{} nil []]
                  [(assoc files-layer :extensions #{".pyy"}) (str dir) #{".pyy"} nil []]
-                 [(assoc files-layer :names ["absent.py"]) (str dir) default-extensions #{"absent.py"} []]
+                 [(assoc files-layer :names #{"optional.py"}) (str dir) default-extensions #{"optional.py"} []]
                  [(assoc files-layer :names #{}) (str dir) default-extensions #{} []]
                  [(assoc files-layer :names #{"other.rb"}) (str dir) default-extensions #{"other.rb"} []]
                  [(assoc files-layer :names #{"test_skip.py"} :blacklist-prefixes ["test_"])
                   (str dir) default-extensions #{"test_skip.py"} ["test_"]]
+                 [(assoc files-layer :local-dir blacklist-dir :extensions #{".py"}
+                         :blacklist-prefixes ["test_"])
+                  blacklist-dir #{".py"} nil ["test_"]]
                  [(assoc files-layer :blacklist-prefixes [""]) (str dir) default-extensions nil [""]]]]
-          (let [spec (update app :layers conj layer)
-                data (ex-data (config-error jib/plan spec))]
-            (is (= [:empty-layer [:layers 1] (:type layer) source extensions names blacklist]
-                   ((juxt :reason :path :layer-type :source-directory :extensions :names :blacklist-prefixes)
-                    data)))))))))
+          (let [filters (if (= :files (:type layer))
+                          {:extensions extensions :names names :blacklist-prefixes blacklist}
+                          {})
+                expected [{:index 1 :type (:type layer) :source source :filters filters}]
+                warning (str "WARNING thin-jar: layer 1 (" (:type layer) " " source
+                             ") selects no files; filters: " filters)
+                spec (update app :layers conj layer)
+                planned (jib/plan spec)]
+            (is (= [] (get-in planned [:layers 1 :entries])))
+            (is (= expected (:empty-layers planned)))
+            (doseq [options [spec (modern-destination spec)]]
+              (let [output (StringWriter.)]
+                (binding [*out* output]
+                  (with-redefs [jib/containerize!
+                                (fn [builder ^Containerizer containerizer]
+                                  (is (= [warning]
+                                         (filter #(str/starts-with? % "WARNING thin-jar:")
+                                                 (str/split-lines (str output)))))
+                                  (.setOfflineMode containerizer true)
+                                  (.setBaseImageLayersCache containerizer (.toPath (io/file dir "base-cache")))
+                                  (.setApplicationLayersCache containerizer (.toPath (io/file dir "app-cache")))
+                                  (containerize! builder containerizer))]
+                    (is (= expected (:empty-layers (jib/deploy! options))))))))))))))
 
 (deftest file-filters-are-validated
   (with-specs
@@ -332,7 +367,6 @@
                  [(assoc app :base {:image "scratch" :reason "Fixture"})
                   [:base :image] [nil "NOT A REF"]]
                  [app [:base-image] [nil "NOT A REF"]]
-                 [app [:verbose] ["false" 1]]
                  [app [:to-tar] [nil " " 1]]
                  [app [:env] [{"KEY" 1} [:key "value"]]]
                  [app [:labels] [nil {:key "value"}]]
@@ -382,7 +416,7 @@
                                                             result))
                                                         layer source-keys))
                                               layers))))
-            defaults {:env {} :verbose true}
+            defaults {:env {} :empty-layers [] :verbose true}
             expected
             [(assoc defaults
                     :destination {:registry "us-west1-docker.pkg.dev/proj/repo/server2:latest"}
@@ -471,6 +505,7 @@
             (is (= "app.jar" (some-> (get layer-files "app.jar") (String. "UTF-8"))))
             (is (= "APP_ENV=test" (.asText (.at config "/config/Env/0"))))
             (is (= {:destination (:to spec)
+                    :empty-layers []
                     :pushed? false
                     :image-digest (:image-digest receipt)
                     :image-id (:image-id receipt)
@@ -532,5 +567,5 @@
 (deftest release-notes-cover-compatibility
   (let [changelog (slurp "CHANGELOG.md")]
     (is (re-find #"(?s)### Behaviour changes.*`deploy!`.*receipt.*nil" changelog))
-    (is (re-find #"(?s)### Behaviour changes.*unknown keys.*wrong-kind.*invalid values.*contain no files.*:container-path.*image root" changelog))
+    (is (re-find #"(?s)### Behaviour changes.*unknown keys.*wrong-kind.*malformed values.*:empty-layers.*:container-path.*image root" changelog))
     (is (re-find #"(?s)### Known, unchanged.*credential.*target image's registry.*f5bd8dd.*fork" changelog))))

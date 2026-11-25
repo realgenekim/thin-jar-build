@@ -12,18 +12,27 @@
   plus a public library version (in the receipt) and one provenance label,
   `org.opencontainers.image.base.name`. No version label: it would change every
   image digest on each library release.
-- Kept the floating `gcr.io/distroless/java21` default: this release makes no
-  breaking change. A later release may record the default base digest as
-  release data and report the live digests across consumers. Announce the
-  tradeoff before changing the default: pinning a digest stops automatic
-  pickup of JDK patches.
+- Kept the floating `gcr.io/distroless/java21` default so consumers continue
+  to pick up JDK patches.
 
 ### Behaviour changes
 
 - `deploy!` returns a receipt. At `f5bd8dd` it returned nil.
-- Planning rejects unknown keys, missing or wrong-kind sources, invalid values,
-  and directory layers that would contain no files.
+- Newly refused configurations include unknown keys, missing or wrong-kind
+  sources, malformed values such as a string or empty entrypoint or unparseable image
+  reference, and conflicting or missing destinations.
+- Vector and list `:names` allowlists now match filenames by value.
+- Empty directory layers are recorded in `:empty-layers` in the plan and both
+  receipt shapes. Jib drops empty layers. Deployment prints one warning per
+  empty layer before building, regardless of `:verbose`.
+
+  ```text
+  WARNING thin-jar: layer <i> (<type> <source>) selects no files; filters: <filters>
+  ```
 - An omitted, nil, or empty directory-layer `:container-path` means the image root `/`.
+
+Compatibility covers every spec the tests and reviews exercised outside the
+refusal list above, and every spec outside that list.
 
 ### Known, unchanged
 

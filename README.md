@@ -75,20 +75,23 @@ keys, and offending keys.
 | app | `:type`, `:jar-path`, `:container-path` | `:type`, `:jar-path`, `:container-path` | `:jar-path` |
 | files | `:type`, `:local-dir`, `:container-path`, `:extensions`, `:blacklist-prefixes`, `:names` | `:type`, `:local-dir` | `:local-dir` |
 
-`:entrypoint` takes a collection or array of strings and may be empty. `:layers`
+`:entrypoint` takes a non-empty collection or array of strings (an empty one
+threw at `f5bd8dd` and would build an image with no command). `:layers`
 takes a non-empty collection or array in build order. Container paths are absolute
 Unix paths. For directory layers, an omitted, nil, or empty `:container-path`
 means the image root `/`.
 
 A `:deps` layer includes every regular file directly in `:lib-dir`. A `:files`
-layer selects regular files directly in `:local-dir` using a collection of
+layer selects regular files directly in `:local-dir` using a collection or array of
 extensions (default `.py`, `.txt`, `.sh`, `.json`, `.yaml`, `.yml`). It then
 applies the optional exact filename allowlist `:names` and the optional exclusion
-list `:blacklist-prefixes`. The allowlist may include absent files. Credential
-logging defaults to enabled. Set `:verbose` to false or nil to disable it.
+list `:blacklist-prefixes`. The allowlist accepts a collection or array of
+strings and may include absent files. Sets retain their own membership rules.
+Credential logging defaults to enabled. Only false and nil disable it.
 
-Planning rejects unknown keys, missing or wrong-kind sources, invalid values,
-and directory layers that would contain no files.
+Planning rejects unknown keys, missing or wrong-kind sources, malformed values
+such as a string entrypoint or an unparseable image reference, and conflicting
+or missing destinations.
 
 ### Destination and base
 
@@ -116,11 +119,21 @@ or contacting a registry. It includes the normalized `:destination`, `:base`
 (with `:reason` or `:legacy true`), `:entrypoint`, `:env`, `:labels`, `:verbose`,
 and the ordered `:layers`. Each layer includes its type, name and entries with
 absolute local `:source` paths and resolved `:container-path` values.
+The plan and both receipt shapes include `:empty-layers`, a vector with
+`{:index i :type t :source dir :filters {...}}` for each directory layer that
+selects no files. The vector is empty when every layer has entries.
+Jib drops empty layers. Before building, `deploy!` prints one line per empty
+layer even when `:verbose` is false or nil.
+
+```text
+WARNING thin-jar: layer <i> (<type> <source>) selects no files; filters: <filters>
+```
 
 `(jib/deploy! spec)` executes that plan. With `:to` it returns this receipt shape:
 
 ```clojure
 {:destination {:tar "target/myapp.tar" :image-name "myapp:local"}
+ :empty-layers []
  :pushed? false
  :image-digest "sha256:..."
  :image-id "sha256:..."

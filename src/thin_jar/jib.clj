@@ -8,7 +8,7 @@
    (com.google.cloud.tools.jib.api.buildplan AbsoluteUnixPath FileEntriesLayer)
    (com.google.cloud.tools.jib.frontend CredentialRetrieverFactory)
    (java.io File)
-   (java.util ArrayList Collection List)
+   (java.util ArrayList Collection List Set)
    (java.util.function Consumer)))
 
 (def version "The thin-jar-build library version." "0.2.0")
@@ -97,7 +97,7 @@
       (and (some? value) (.isArray (class value)))))
 
 (defn- string-collection? [value]
-  (and (non-map-collection? value) (every? string? value)))
+  (and (collection-or-array? value) (every? string? value)))
 
 (defn- validate-file-filters! [{:keys [names extensions blacklist-prefixes] :as layer}
                                path allowed]
@@ -188,13 +188,11 @@
     (validate-keys! spec [] contract)
     (validate-destination! spec allowed)
     (validate-base! spec allowed)
-    (let [{:keys [entrypoint layers env labels verbose]} spec]
-      (when-not (and (collection-or-array? entrypoint) (every? string? entrypoint))
+    (let [{:keys [entrypoint layers env labels]} spec]
+      (when-not (and (collection-or-array? entrypoint) (seq entrypoint) (every? string? entrypoint))
         (invalid-value! [:entrypoint] allowed))
       (when-not (and (collection-or-array? layers) (seq layers))
         (invalid-config! :invalid-layers [:layers] allowed [:layers]))
-      (when (and (some? verbose) (not (boolean? verbose)))
-        (invalid-value! [:verbose] allowed))
       (when (and (some? env) (not (string-map? env)))
         (invalid-value! [:env] allowed))
       (when (and (contains? spec :labels) (not (string-map? labels)))
@@ -222,11 +220,14 @@
         :when (and (.isFile file) (include? (.getName file)))]
     (file-entry file (str container-path "/" (.getName file)))))
 
+(defn- as-filter-set [values]
+  (if (instance? Set values) values (set values)))
+
 (defn- plan-layer [index {:keys [type lib-dir jar-path local-dir container-path extensions blacklist-prefixes names]
                           :or {extensions #{".py" ".txt" ".sh" ".json" ".yaml" ".yml"}
                                blacklist-prefixes []}}]
-  (let [extensions (set extensions)
-        names (when (some? names) (set names))
+  (let [extensions (as-filter-set extensions)
+        names (some-> names as-filter-set)
         [name entries]
         (case type
           :deps ["dependencies" (directory-entries lib-dir container-path (constantly true))]
@@ -238,16 +239,16 @@
                                             (or (nil? names) (contains? names filename))
                                             (not-any? #(str/starts-with? filename %) blacklist-prefixes))))])
         entries (vec entries)]
-    (when (empty? entries)
-      (invalid-config! :empty-layer [:layers index] (get-in spec-contract [:layers type :allowed])
-                       nil (merge {:layer-type type :source-directory (or lib-dir local-dir)}
-                                  (when (= :files type)
-                                    {:extensions extensions
-                                     :names names
-                                     :blacklist-prefixes blacklist-prefixes}))))
-    {:type type
-     :name name
-     :entries entries}))
+    (cond-> {:type type :name name :entries entries}
+      (empty? entries)
+      (assoc :empty-layer {:index index
+                           :type type
+                           :source (or lib-dir local-dir)
+                           :filters (if (= :files type)
+                                      {:extensions extensions
+                                       :names names
+                                       :blacklist-prefixes blacklist-prefixes}
+                                      {})}))))
 
 (defn- library-labels [base]
   {base-label (:image base)})
@@ -257,7 +258,8 @@
   [spec]
   (let [{:keys [to target-image to-tar base base-image entrypoint env labels layers verbose]
          :or {base-image default-base verbose true}} (validate-spec! spec)
-        base (or base {:image base-image :legacy true})]
+        base (or base {:image base-image :legacy true})
+        planned-layers (mapv plan-layer (range) layers)]
     {:destination (or to
                       (if to-tar
                         {:tar to-tar :image-name target-image}
@@ -266,7 +268,8 @@
      :entrypoint (vec entrypoint)
      :env (or env {})
      :labels (merge labels (library-labels base))
-     :layers (mapv plan-layer (range) layers)
+     :layers (mapv #(dissoc % :empty-layer) planned-layers)
+     :empty-layers (into [] (keep :empty-layer) planned-layers)
      :verbose verbose}))
 
 (defn- make-containerizer [target-image to-tar logger]
@@ -298,10 +301,13 @@
 (defn- containerize! [^JibContainerBuilder builder ^Containerizer containerizer]
   (.containerize builder containerizer))
 
-(defn- execute-plan! [{:keys [destination base entrypoint env labels layers verbose]} layer-specs]
+(defn- execute-plan! [{:keys [destination base entrypoint env labels layers empty-layers verbose]} layer-specs]
   (let [{:keys [registry tar image-name]} destination
         target-image (or registry image-name)
         logger (make-logger verbose)]
+    (doseq [{:keys [index type source filters]} empty-layers]
+      (println (str "WARNING thin-jar: layer " index " (" type " " source
+                    ") selects no files; filters: " filters)))
     (println (if tar
                "Building container image tarball with Jib (no push)..."
                "Building and pushing container image with Jib..."))
@@ -328,6 +334,7 @@
           (println "Container image built and pushed successfully!"))
         (println (str "  Image: " target-image))
         {:destination destination
+         :empty-layers empty-layers
          :pushed? (.isImagePushed result)
          :image-digest (str (.getDigest result))
          :image-id (str (.getImageId result))

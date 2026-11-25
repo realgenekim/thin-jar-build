@@ -340,7 +340,7 @@
   (with-specs
     (fn [{:keys [files]} _]
       (doseq [[key values] {:names ["main.py" #{:main.py} {"main.py" true}]
-                            :extensions [nil #{:py} ".py" {".py" true}]
+                            :extensions [#{:py} ".py" {".py" true}]
                             :blacklist-prefixes ["main" [:main]]}
               value values]
         (testing (pr-str [key value])
@@ -569,3 +569,25 @@
     (is (re-find #"(?s)### Behaviour changes.*`deploy!`.*receipt.*nil" changelog))
     (is (re-find #"(?s)### Behaviour changes.*unknown keys.*wrong-kind.*malformed values.*:empty-layers.*:container-path.*image root" changelog))
     (is (re-find #"(?s)### Known, unchanged.*credential.*target image's registry.*f5bd8dd.*fork" changelog))))
+
+(deftest legacy-value-forms-still-plan
+  (with-specs
+    (fn [{:keys [deps files app]} dir]
+      (testing "a java.io.File container path on both directory layer types"
+        (is (= (container-paths deps)
+               (container-paths (assoc-in deps [:layers 0 :container-path] (java.io.File. "/lib")))))
+        (is (= (container-paths files)
+               (container-paths (assoc-in files [:layers 0 :container-path] (java.io.File. "/scripts"))))))
+      (testing "an ImageReference base image"
+        (let [ref "example.invalid/team/base:1"]
+          (is (= ref (get-in (jib/plan (assoc app :base-image (com.google.cloud.tools.jib.api.ImageReference/parse ref)))
+                             [:base :image])))))
+      (testing ":extensions nil is an empty selection, reported rather than refused"
+        (let [planned (jib/plan (update files :layers
+                                        (fn [layers] (conj (vec (:layers app)) (assoc (first layers) :extensions nil)))))]
+          (is (= [1] (mapv :index (:empty-layers planned))))))
+      (testing "an array of blacklist prefixes is reported as its values"
+        (let [spec (assoc-in files [:layers 0] (assoc (first (:layers files))
+                                                      :extensions #{".none"}
+                                                      :blacklist-prefixes (into-array String ["test_"])))]
+          (is (= ["test_"] (get-in (jib/plan spec) [:empty-layers 0 :filters :blacklist-prefixes]))))))))

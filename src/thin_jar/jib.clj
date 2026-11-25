@@ -181,10 +181,29 @@
     (when (contains? spec :base-image)
       (validate-image! (:base-image spec) [:base-image] allowed))))
 
-(defn validate-spec!
-  "Return spec if its configuration and layer sources are valid. Throw ex-info otherwise."
+(defn- normalize-legacy-layer
+  "Convert legacy value forms that f5bd8dd accepted into the forms validation expects."
+  [layer]
+  (cond-> layer
+    (and (map? layer) (instance? File (:container-path layer)))
+    (update :container-path #(.getPath ^File %))
+    (and (map? layer) (contains? layer :extensions) (nil? (:extensions layer)))
+    (assoc :extensions #{})))
+
+(defn- normalize-legacy-values
+  "A java.io.File container path, an ImageReference base image and :extensions nil (an empty
+   selection) all worked at f5bd8dd; normalize them before validation."
   [spec]
-  (let [{:keys [allowed] :as contract} (:top spec-contract)]
+  (cond-> spec
+    (instance? ImageReference (:base-image spec)) (update :base-image str)
+    (collection-or-array? (:layers spec)) (update :layers #(mapv normalize-legacy-layer %))))
+
+(defn validate-spec!
+  "Return the (normalized) spec if its configuration and layer sources are valid. Throw ex-info
+   otherwise."
+  [spec]
+  (let [spec (normalize-legacy-values spec)
+        {:keys [allowed] :as contract} (:top spec-contract)]
     (validate-keys! spec [] contract)
     (validate-destination! spec allowed)
     (validate-base! spec allowed)
@@ -200,8 +219,8 @@
       (when-let [reserved (seq (filter #(contains? labels %) [base-label]))]
         (invalid-config! :conflicting-keys [:labels] allowed reserved))
       (doseq [[index layer] (map-indexed vector layers)]
-        (validate-layer! index layer))))
-  spec)
+        (validate-layer! index layer)))
+    spec))
 
 (defn make-logger
   "Create a Jib logger Consumer."
@@ -247,7 +266,7 @@
                            :filters (if (= :files type)
                                       {:extensions extensions
                                        :names names
-                                       :blacklist-prefixes blacklist-prefixes}
+                                       :blacklist-prefixes (vec blacklist-prefixes)}
                                       {})}))))
 
 (defn- library-labels [base]
